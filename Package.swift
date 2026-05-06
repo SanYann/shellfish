@@ -7,6 +7,7 @@ let package = Package(
     targets: [
         .executableTarget(name: "Harness", path: "Sources/Harness"),
         .executableTarget(name: "HarnessS2", path: "Sources/HarnessS2"),
+        .executableTarget(name: "HarnessS4", path: "Sources/HarnessS4"),
         .executableTarget(name: "ToolRunner", path: "Sources/ToolRunner"),
         .executableTarget(name: "AttackerObserver", path: "Sources/AttackerObserver"),
     ]

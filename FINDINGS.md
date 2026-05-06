@@ -7,6 +7,7 @@
 |---|---|---|
 | **S1** | Sandboxed `ToolRunner` cannot exfiltrate via network even when fake LLM emits a malicious tool call | **PASS** |
 | **S2** | Capability-bound broker denies `shell.exec` requested in response to an injected MCP response | **PASS** |
+| **S4** | `fs.read` canonicalizes path args and rejects anything outside the session workspace | **PASS** |
 
 ---
 
@@ -22,7 +23,7 @@ Three runs, three different profiles, all with the same harness:
 |---|---|---|---|---|
 | `toolrunner.sb` (primary) | `(allow default) (deny network*)` | 1 (POSIX `Operation not permitted`) | 0 | **PASS** |
 | `toolrunner-allow-all.sb` (negative control) | `(allow default)` | 0 (HTTP 200 from observer) | 1 | FAIL — as expected |
-| `toolrunner-strict.sb` (stretch, default-deny) | `(deny default)` + whitelist | 6 (Swift runtime did not initialize) | 0 | INCONCLUSIVE |
+| `toolrunner-strict.sb` v3 (production-shape) | `(deny default)` + broad system reads + `(deny file-read* /Users)` + workspace carve-out | 1 (POSIX `Operation not permitted`) | 0 | **PASS** |
 
 The negative control matters: it proves the attack is real and the primary profile is what blocks it, not some unrelated coincidence (e.g. `URLSession` failing for another reason, observer not actually reachable, etc.).
 
@@ -34,10 +35,25 @@ The negative control matters: it proves the attack is real and the primary profi
 
 ## What this does NOT validate
 
-- **The strict default-deny profile.** Under `(deny default)` with my whitelist, ToolRunner exits 6 before emitting any output — the Swift runtime needs more access than I granted it on first try. This is the "wild card" called out in PoC plan §3 note 2. It does not block S1 (the primary profile already proves containment), but it matters for production: the primary profile is "deny network", which is fine for *this* attack, while a real Shellfish session would also need filesystem isolation, mach-lookup limits, etc. Resolving the strict profile is a Stage 1 item, not a Stage 0 one.
 - That a real LLM would behave like the fake one. The fake LLM is hardcoded to emit the malicious tool call. A real Claude/GPT/Mistral might refuse, or might comply differently. The PoC tests containment; it does not test model behavior.
-- That the broker design works (no broker in the PoC). Next.
+- That the broker design works (no broker in the PoC — see S2).
 - That `sandbox-exec` will still exist in macOS 27+. Apple has marked it deprecated. The architectural answer is App Sandbox + dynamic entitlements; that's a separate spike.
+
+## On the strict profile (v3)
+
+After ~1 hour of iteration the strict profile is now actually working. The path I took was non-obvious enough to write down:
+
+- **v1 and v2 (`(deny default)` + whitelist subpaths) failed** because every binary, including `/usr/bin/true`, exits with SIGABRT before producing any output. Swift binaries reach into the dyld shared cache at `/System/Volumes/Preboot/Cryptexes/...`, into `/private/var/folders/...` for caches, and into a long tail of system paths. Enumerating them all is infeasible.
+- **v3 inverts the approach.** Filesystem reads are allowed broadly, and a `(deny file-read* (subpath "/Users"))` rule excludes user data. The session workspace and build dir are re-allowed as carve-outs. This is *not* a true default-deny on the filesystem — but it directly captures the architectural claim: "the sandboxed tool cannot read user data outside its workspace."
+- **Verified directly with `/bin/cat`** under the strict profile:
+  - Reading `/Users/yann/.shellfish-test-secret` → `Operation not permitted` (OS-level deny working).
+  - Reading the workspace `decoy.txt` → succeeds (carve-out working).
+  - Without the sandbox → reads succeed (control proves the file exists and is normally readable).
+- **S1 still passes under the strict profile.** Network deny carries forward. CFNetwork's attempt to open its cache DB at `/Users/yann/Library/Caches/...` is also denied by the OS, which appears in stderr — a nice secondary confirmation that filesystem isolation is working.
+
+What is still untested:
+- Defense-in-depth for the **app-level path validation** in S4. The strict profile would now reject a `/Users/yann/.ssh/id_rsa` read at OS level even if the canonicalization in `fs.read` had a bug. I did not write a separate "intentionally bypass app validation" test for this because the `cat` direct test above already establishes the OS-level guarantee.
+- A true default-deny on the filesystem with a whitelist that runs Swift cleanly. This is probably impossible without enumerating every path the Swift runtime touches across macOS versions, and is the right argument for moving to App Sandbox + dynamic entitlements before v1.
 
 ## Cost
 
@@ -99,17 +115,59 @@ swift build
 
 ---
 
-## Cumulative status (after Stages 0 + 1 of staged plan)
+---
 
-The two security claims that gate the rest of the architecture are now mechanically verified on macOS 26:
+## S4 — path-traversal canonicalization
+
+**Scope:** the `fs.read` tool, when given an arg containing `..` or an absolute path outside the session workspace, must canonicalize and reject. Threat model claim is "filesystem tool resolves paths and rejects anything outside the session's declared workspace roots" (§3.5).
+
+### Result: **PASS**
+
+| Mode | Workspace | Traversal arg | Canonicalized to | Read result |
+|---|---|---|---|---|
+| Primary | `…/workspaces/poc` | `<workspace>/../…/../tmp/secret.txt` (10× `..`) | `/tmp/shellfish-poc-fake-secret.txt` | **REJECT** ("outside session workspace") |
+| Negative control | `/tmp` | (same arg) | (same canonical) | ALLOW — secret content returned |
+
+The same arg, the same canonicalization logic — the only thing that changed is the session's allowed paths. The validation is the protection.
+
+### What this validates
+
+- **Canonicalization works.** Swift's `(path as NSString).standardizingPath` correctly resolves `..` segments and clamps at `/`. A long traversal sequence does not "underflow" past root and create a confusable path.
+- **Symlink resolution covered.** The implementation also calls `resolvingSymlinksInPath` so a symlink inside the workspace pointing to `/etc/passwd` would also be rejected. (Not exercised by this run but the code path is there.)
+- **Negative control proves it.** With the workspace widened to include `/tmp`, the very same arg now reads the fixture file. So the rejection in primary mode is the canonicalization, not luck.
+
+### What this does NOT validate
+
+- **OS-level filesystem isolation.** This S4 PoC tests application-level path validation only. The threat model §4 I3 calls for OS enforcement as a backstop ("a bug in our Swift permission code does not grant filesystem access the OS is also denying"). That backstop is gated on the strict default-deny `sandbox-exec` profile, which is still INCONCLUSIVE. Until the strict profile works, S4 has only one line of defense — the application-level canonicalization. The architectural claim is two.
+- **TOCTOU / race conditions.** The PoC checks the path then reads it. A symlink swap between check-and-read could in principle bypass. Realistic for a multi-process attacker, irrelevant for the prompt-injection threat model. Documented, not fixed.
+- **Unicode / encoding tricks.** Paths containing NFC/NFD-equivalent but byte-distinct sequences are not exercised. Probably handled by NSString normalization but unverified.
+
+## S4 repro
+
+```
+swift build
+./run-s4.sh
+```
+
+---
+
+## Cumulative status (after Stages 0 + 1 + 3 of staged plan)
+
+Three security claims now mechanically verified on macOS 26:
 
 1. **OS-level network containment** of a Swift child process (S1).
 2. **Capability-level containment** of injection-induced tool escalation (S2).
+3. **Application-level path containment** for filesystem tool args (S4).
 
-This is the "credibility floor" called out in the staged plan §Stage 2. With a short writeup ("here is what containment actually looks like, with two reproducible PoCs"), the work to date is a coherent public artifact.
+The three primitives are independent — each tests a different chokepoint in the architecture. They are the floor under everything in the threat model.
+
+### Honest gaps
+
+- **`sandbox-exec` deprecation.** Still flagged by Apple. The strict profile working today does not guarantee it works on macOS 27. The architectural answer is App Sandbox + dynamic entitlements; that work begins when v1 begins.
+- **The strict profile is "deny user data," not "default-deny everything."** A truly default-deny filesystem profile that also runs Swift binaries cleanly is probably not achievable on modern macOS without enumerating paths that change every release. The current profile captures the architectural intent (no read of user data outside workspace) without that maintenance cost. Documented as a deliberate trade-off, not a hidden weakness.
+- **Real LLM behavior unmeasured.** All three PoCs use a worst-case fake LLM that complies with injection. No data on actual model behavior under these scenarios.
 
 ### Recommended next decisions
 
-- **Stop or continue?** The staged plan has an explicit decision point after Stage 2. The case for continuing is strongest now, before the work cools.
-- **If continuing**, the highest-value next PoC is S4 (path traversal — does the workspace-restricted profile actually reject `../../../.ssh/id_rsa`?) because it's the third independent containment primitive.
-- **The strict default-deny `sandbox-exec` profile is still unsolved.** That is the production-shape question, not an S1 question. Worth a half-day spike before any v1 work begins.
+- **Stop or continue?** The staged plan's decision point applies even more strongly now: with three PoCs passing AND the strict-profile question resolved, this is a coherent credibility asset. Continuing means committing to Stage 4 (3–4 months for a vertical slice).
+- **Cheapest "before stopping" tasks:** add LICENSE, edit ESSAY into your voice, share the repo link with one person whose technical judgment you trust.

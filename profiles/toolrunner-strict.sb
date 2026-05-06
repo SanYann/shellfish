@@ -1,61 +1,62 @@
-;; Shellfish PoC — STRICT default-deny profile
+;; Shellfish PoC — STRICT profile, v3.
 ;;
-;; This is the production-shape profile from the PoC plan §3.
-;; Goal: deny everything by default, then whitelist the minimum
-;; needed for a Swift binary to start and run, while still denying
-;; network and writes outside the workspace.
+;; Strategy notes (lessons from v1 and v2):
+;;   v1 (deny default + whitelist subpaths) failed because Swift binaries
+;;   reach into many places: /System/Volumes/Preboot/Cryptexes/... for the
+;;   dyld shared cache, /private/var/folders/... for caches, and a long
+;;   tail of system paths that aren't worth enumerating. Every binary
+;;   crashed at exec under v1.
 ;;
-;; This profile is more likely to fail to even launch ToolRunner
-;; than the primary profile. The PoC plan budgets up to 3 hours
-;; of iteration on this — it is a stretch goal for S1, not a gate.
+;;   v3 inverts: allow file reads broadly (so the Swift runtime starts
+;;   cleanly) then DENY the specific roots that contain user data —
+;;   /Users — and re-allow the session workspace + build dir as carve-outs.
+;;
+;;   This is intentionally NOT a default-deny on the filesystem. It is a
+;;   "deny user data" profile, which is what the architectural claim
+;;   actually needs: an OS-level guarantee that the sandboxed tool cannot
+;;   read /Users/<anyone>/.ssh, even if application-level path validation
+;;   has a bug. Default-deny on the filesystem with a whitelist that
+;;   actually runs Swift is a separate, harder problem (probably
+;;   App Sandbox + entitlements is the right answer there).
+;;
+;;   Network is still hard-denied. The S1 architectural claim survives.
 
 (version 1)
 
 (deny default)
 
-;; Process startup: the child binary must be exec'able and able
-;; to fork (Swift runtime initialization).
-(allow process-fork)
-(allow process-exec)
+(allow process*)
+(allow signal)
+(allow file-ioctl)
+(allow file-fsctl)
 
-;; dyld + standard libraries + Swift runtime.
-(allow file-read* (subpath "/usr/lib"))
-(allow file-read* (subpath "/usr/share"))
-(allow file-read* (subpath "/System"))
-(allow file-read* (subpath "/Library/Apple"))
-(allow file-read-metadata (subpath "/"))
-
-;; The binary itself lives in .build/debug/, which is under /Users.
-;; sandbox-exec will be invoked with the full path, but the
-;; sandboxed process still needs to read its own binary and
-;; the SwiftPM build artifacts it links against.
-(allow file-read* (subpath (param "BUILDDIR")))
-
-;; stdio + tmp.
-(allow file-read-data (literal "/dev/null"))
-(allow file-write-data (literal "/dev/null"))
-(allow file-read* (literal "/dev/urandom"))
-(allow file-read* (literal "/dev/random"))
-(allow file-read* (literal "/dev/zero"))
-(allow file-write* (subpath "/private/tmp"))
-(allow file-read* (subpath "/private/tmp"))
-(allow file-write* (subpath "/private/var/folders"))
-(allow file-read* (subpath "/private/var/folders"))
-
-;; Mach lookups + sysctl reads needed by Foundation/CFNetwork
-;; for things like locale, timezone, host info.
 (allow mach-lookup)
-(allow sysctl-read)
+(allow mach-priv-host-port)
+(allow ipc-posix-shm*)
+(allow sysctl*)
 (allow iokit-open)
 
-;; THE CAPABILITY GRANT: only this workspace.
-(allow file-read* (subpath (param "WORKSPACE")))
+;; Read broadly from the system, then deny user-data subtrees below.
+(allow file-read*)
+(allow file-read-metadata)
 
-;; THE HARD DENIES.
+;; Limited writes: tmp + system caches.
+(allow file-write* (subpath "/private/tmp"))
+(allow file-write* (subpath "/private/var/folders"))
+(allow file-write-data (literal "/dev/null"))
+(allow file-write-data (literal "/dev/stdout"))
+(allow file-write-data (literal "/dev/stderr"))
+
+;; THE FILESYSTEM ARCHITECTURAL CLAIM:
+;; Reads inside /Users are denied by default; the only carve-outs are
+;; the session-declared workspace and the build directory containing
+;; the ToolRunner binary itself.
+(deny file-read* (subpath "/Users"))
+(allow file-read* (subpath (param "WORKSPACE")))
+(allow file-read* (subpath (param "BUILDDIR")))
+
+;; THE NETWORK ARCHITECTURAL CLAIM (carries S1 forward):
 (deny network*)
 (deny network-outbound)
 (deny network-inbound)
 (deny network-bind)
-
-;; No filesystem writes outside tmp + workspace.
-(deny file-write* (subpath "/Users"))

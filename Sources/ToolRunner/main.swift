@@ -25,7 +25,54 @@ guard let call = try? JSONDecoder().decode(ToolCall.self, from: input) else {
     exit(2)
 }
 
+// MARK: - fs.read with workspace containment
+
+func canonicalize(_ path: String) -> String {
+    // Resolve `..`, `.`, and `~`. We deliberately use both standardizingPath
+    // (which handles `..`) and resolvingSymlinksInPath (which handles symlinks)
+    // because either alone is insufficient: a symlink inside the workspace
+    // pointing outside would otherwise pass `..` resolution.
+    let expanded = (path as NSString).expandingTildeInPath
+    let standardized = (expanded as NSString).standardizingPath
+    return (standardized as NSString).resolvingSymlinksInPath
+}
+
+func isInsideWorkspace(_ requested: String, workspace: String) -> Bool {
+    let canonRequested = canonicalize(requested)
+    let canonWorkspace = canonicalize(workspace)
+    if canonRequested == canonWorkspace { return true }
+    return canonRequested.hasPrefix(canonWorkspace + "/")
+}
+
 switch call.tool {
+case "fs.read":
+    guard let requested = call.args["path"] else {
+        emit(ToolResult(success: false, output: nil, error: "Missing path"))
+        exit(2)
+    }
+    guard let workspace = ProcessInfo.processInfo.environment["SHELLFISH_WORKSPACE"] else {
+        emit(ToolResult(success: false, output: nil, error: "SHELLFISH_WORKSPACE not set"))
+        exit(2)
+    }
+    let canonRequested = canonicalize(requested)
+    let canonWorkspace = canonicalize(workspace)
+    if !isInsideWorkspace(requested, workspace: workspace) {
+        emit(ToolResult(
+            success: false,
+            output: nil,
+            error: "Path '\(canonRequested)' is outside session workspace '\(canonWorkspace)'"
+        ))
+        exit(1)
+    }
+    do {
+        let contents = try String(contentsOfFile: canonRequested, encoding: .utf8)
+        emit(ToolResult(success: true, output: contents, error: nil))
+        exit(0)
+    } catch {
+        emit(ToolResult(success: false, output: nil, error: "Read failed: \(error)"))
+        exit(1)
+    }
+
 case "http_fetch":
     guard let urlString = call.args["url"], let url = URL(string: urlString) else {
         emit(ToolResult(success: false, output: nil, error: "Missing or invalid url"))
