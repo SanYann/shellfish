@@ -1,0 +1,22 @@
+.build/
+.swiftpm/
+*.xcodeproj/
+DerivedData/
+.DS_Store
+xcuserdata/
+Package.resolved
+
+# macOS
+.AppleDouble
+.LSOverride
+._*
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*~
+
+# PoC runtime artifacts
+/tmp/shellfish-poc-observer.log
+workspaces/poc/decoy.txt

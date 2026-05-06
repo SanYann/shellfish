@@ -1,0 +1,5 @@
+;; Negative control: allow everything.
+;; If the attack still fails under this profile, something other
+;; than the sandbox is blocking it (and S1 is unproven).
+(version 1)
+(allow default)

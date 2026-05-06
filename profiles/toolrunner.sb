@@ -1,0 +1,23 @@
+;; Shellfish PoC — primary sandbox profile
+;;
+;; This is the *minimal* profile that proves the S1 claim:
+;; the sandboxed ToolRunner cannot make outbound network calls,
+;; even though it tries.
+;;
+;; Strategy: allow everything by default, then explicitly deny
+;; network. Filesystem isolation is tested by the strict profile
+;; (toolrunner-strict.sb). Keeping S1 focused on network egress
+;; lets us isolate the network-deny primitive from dyld/runtime
+;; complexity.
+
+(version 1)
+(allow default)
+
+;; THE CORE TEST: deny all network access.
+(deny network*)
+
+;; Belt-and-suspenders: explicit specific denies in case
+;; network* doesn't cover something we missed.
+(deny network-outbound)
+(deny network-inbound)
+(deny network-bind)
