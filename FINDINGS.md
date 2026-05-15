@@ -62,13 +62,11 @@ What is still untested:
 
 ## What I'd do next
 
-In priority order:
+S1, S2, and S4 are done. The strict-profile question is resolved. Remaining items:
 
-1. **Stage 1 — S2 PoC.** Malicious MCP response cannot auto-execute via shell. This tests the PermissionBroker stub that S1 deliberately skipped.
-2. **Strict-profile spike.** Get a default-deny profile that runs Swift cleanly. Probably needs `(allow mach-lookup)` to specific services, more `iokit-open` entries, and `(allow file-read*)` on a few `/usr/share` paths. ½–1 day of work.
-3. **App Sandbox alternative.** Determine whether `sandbox-exec` deprecation is a real problem or a docs-only one for our use case. Spike: same S1 scenario but using `NSXPCConnection` + a properly-entitled App Sandbox helper instead of `sandbox-exec`.
-
-Items 2 and 3 are independent and could be done in either order.
+1. **App Sandbox alternative spike.** `sandbox-exec` is officially deprecated. Same S1/S4 scenarios but using a properly-entitled App Sandbox helper. Half-day. This is what protects you against macOS 27+.
+2. **Stage 4 build (the real work).** See `docs/stage4-plan.md` — 3–4 months for a vertical-slice app.
+3. **(Optional)** S3 / S5 / S7 PoCs to widen the validated surface. Lower value than (1) and (2).
 
 ## S1 repro
 
@@ -76,7 +74,7 @@ Items 2 and 3 are independent and could be done in either order.
 swift build
 ./run.sh                                                    # primary profile, PASS
 SHELLFISH_PROFILE=$(pwd)/profiles/toolrunner-allow-all.sb ./run.sh   # negative control, FAIL (expected)
-SHELLFISH_PROFILE=$(pwd)/profiles/toolrunner-strict.sb ./run.sh      # strict, INCONCLUSIVE
+SHELLFISH_PROFILE=$(pwd)/profiles/toolrunner-strict.sb ./run.sh      # strict (v3), PASS
 ```
 
 ---
@@ -138,7 +136,7 @@ The same arg, the same canonicalization logic — the only thing that changed is
 
 ### What this does NOT validate
 
-- **OS-level filesystem isolation.** This S4 PoC tests application-level path validation only. The threat model §4 I3 calls for OS enforcement as a backstop ("a bug in our Swift permission code does not grant filesystem access the OS is also denying"). That backstop is gated on the strict default-deny `sandbox-exec` profile, which is still INCONCLUSIVE. Until the strict profile works, S4 has only one line of defense — the application-level canonicalization. The architectural claim is two.
+- **OS-level filesystem isolation through HarnessS4.** This S4 PoC tests application-level path validation only — HarnessS4 invokes ToolRunner without `sandbox-exec`. The OS-level backstop demanded by threat model §4 I3 *is* now available via the strict profile (see S1's strict-profile section, where `/bin/cat /Users/yann/.shellfish-test-secret` was directly verified as denied). Wiring HarnessS4 to also run under the strict profile would give the formal two-layer demonstration. For Stage 4 work this happens naturally when the conversation loop invokes ToolRunner under the strict profile by default.
 - **TOCTOU / race conditions.** The PoC checks the path then reads it. A symlink swap between check-and-read could in principle bypass. Realistic for a multi-process attacker, irrelevant for the prompt-injection threat model. Documented, not fixed.
 - **Unicode / encoding tricks.** Paths containing NFC/NFD-equivalent but byte-distinct sequences are not exercised. Probably handled by NSString normalization but unverified.
 
