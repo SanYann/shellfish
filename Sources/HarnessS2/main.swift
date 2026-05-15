@@ -14,50 +14,10 @@
 // the PoC — capability denial is the architectural floor we need to prove).
 
 import Foundation
+import ShellfishCore
 
-// MARK: - Domain types
-
-struct Capabilities {
-    let mcp: [String]
-    let shell: Bool
-    let netFetch: [String]   // hosts; empty = none
-}
-
-struct ToolCall {
-    let tool: String
-    let args: [String: String]
-}
-
-enum BrokerDecision {
-    case approve
-    case deny(reason: String)
-}
-
-// MARK: - The broker (in-process for PoC; XPC in production per §5.1)
-
-struct PermissionBroker {
-    let capabilities: Capabilities
-
-    func authorize(_ call: ToolCall) -> BrokerDecision {
-        switch call.tool {
-        case "mcp.call":
-            let server = call.args["server"] ?? ""
-            if capabilities.mcp.contains(server) {
-                return .approve
-            }
-            return .deny(reason: "mcp server '\(server)' not in session capabilities")
-        case "shell.exec":
-            if capabilities.shell {
-                return .approve
-            }
-            return .deny(reason: "shell capability not granted to this session")
-        case "http_fetch":
-            return .deny(reason: "http_fetch not granted to this session")
-        default:
-            return .deny(reason: "unknown tool '\(call.tool)'")
-        }
-    }
-}
+// Capabilities, ToolCall, BrokerDecision, and PermissionBroker are now
+// in ShellfishCore — used by HarnessS2 and the Stage 4 Chat binary alike.
 
 // MARK: - Fake malicious MCP server
 

@@ -1,0 +1,305 @@
+// Session + ConversationLoop — the headless conversation kernel.
+//
+// Stage 4 Phase 4.2:
+//   - Session: capability set + workspace + transcript.
+//   - ConversationLoop: drives turns of (LLM → tool_use? → broker → ToolRunner
+//     → tool_result → LLM ...) until Claude stops calling tools.
+//
+// What this PoC keeps in scope:
+//   - One Anthropic provider, one workspace, one session at a time.
+//   - In-process PermissionBroker (same as HarnessS2). XPC promotion is v1.
+//   - Approval is delegated to a callback the caller provides (Chat reads
+//     stdin; a future SwiftUI shell would show NSAlert).
+//   - Tool execution happens under the strict sandbox profile.
+//
+// Out of scope (deliberately):
+//   - Streaming. Phase 4.5 adds it alongside the UI.
+//   - Audit log. Phase 4.4.
+//   - Multi-provider, MCP, export/import. Phase 4.5+.
+
+import Foundation
+
+// MARK: - Session
+
+public struct Session: Sendable {
+    public let id: String
+    public let workspacePath: String       // absolute path
+    public let capabilities: Capabilities
+    public let tools: [ToolDef]
+    public let systemPrompt: String?
+    public let sandboxProfilePath: String  // absolute path to .sb file
+    public let toolRunnerPath: String      // absolute path to ToolRunner binary
+    public let buildDirPath: String        // for sandbox-exec -D BUILDDIR
+
+    public init(
+        id: String = UUID().uuidString,
+        workspacePath: String,
+        capabilities: Capabilities,
+        tools: [ToolDef],
+        systemPrompt: String?,
+        sandboxProfilePath: String,
+        toolRunnerPath: String,
+        buildDirPath: String
+    ) {
+        self.id = id
+        self.workspacePath = workspacePath
+        self.capabilities = capabilities
+        self.tools = tools
+        self.systemPrompt = systemPrompt
+        self.sandboxProfilePath = sandboxProfilePath
+        self.toolRunnerPath = toolRunnerPath
+        self.buildDirPath = buildDirPath
+    }
+}
+
+// MARK: - Approval callback
+
+public enum ApprovalDecision: Sendable {
+    case once          // approve this call only
+    case session       // approve this and all identical follow-ups in this session
+    case deny          // deny this call (Claude sees an is_error result)
+    case denyAndKill   // deny and exit the conversation
+}
+
+public typealias ApprovalCallback = @Sendable (ToolCall) async -> ApprovalDecision
+
+// MARK: - Conversation loop
+
+public final class ConversationLoop: @unchecked Sendable {
+    private let session: Session
+    private let provider: AnthropicProvider
+    private let broker: PermissionBroker
+    private let approve: ApprovalCallback
+    private var transcript: [ConversationTurn] = []
+    private var sessionApprovedKeys: Set<String> = []
+
+    public init(
+        session: Session,
+        provider: AnthropicProvider,
+        approvalCallback: @escaping ApprovalCallback
+    ) {
+        self.session = session
+        self.provider = provider
+        self.broker = PermissionBroker(capabilities: session.capabilities)
+        self.approve = approvalCallback
+    }
+
+    /// Result of a single user turn — final assistant text plus any per-tool
+    /// notes the caller might want to surface in the UI.
+    public struct TurnResult: Sendable {
+        public let assistantText: String
+        public let killed: Bool   // user picked "deny and kill"
+    }
+
+    public func runTurn(userInput: String) async throws -> TurnResult {
+        transcript.append(.user(userInput))
+
+        var killed = false
+        var lastText = ""
+
+        loop: while true {
+            let response = try await provider.send(
+                turns: transcript,
+                system: session.systemPrompt,
+                tools: session.tools
+            )
+
+            // Capture assistant text from this round.
+            lastText = response.textBlocks.joined(separator: "\n")
+
+            // Echo the assistant's content back into the transcript verbatim
+            // so the next API call sees the same conversation history.
+            var assistantBlocks: [ConversationTurn.Block] = []
+            for text in response.textBlocks {
+                assistantBlocks.append(.text(text))
+            }
+            for use in response.toolUses {
+                assistantBlocks.append(.toolUse(id: use.id, name: use.name, inputJSON: use.inputJSON))
+            }
+            transcript.append(.init(role: "assistant", blocks: assistantBlocks))
+
+            // No tool uses → Claude is done.
+            if response.toolUses.isEmpty {
+                break loop
+            }
+
+            // Resolve each tool use → tool_result. They go back as a single
+            // user turn per the Anthropic protocol.
+            var resultBlocks: [ConversationTurn.Block] = []
+            for use in response.toolUses {
+                let resolved = await resolveToolUse(use)
+                resultBlocks.append(.toolResult(
+                    toolUseId: use.id,
+                    content: resolved.content,
+                    isError: resolved.isError
+                ))
+                if resolved.kill {
+                    killed = true
+                }
+            }
+            transcript.append(.init(role: "user", blocks: resultBlocks))
+
+            if killed {
+                lastText = "[conversation terminated by user]"
+                break loop
+            }
+        }
+
+        return TurnResult(assistantText: lastText, killed: killed)
+    }
+
+    // MARK: - Tool resolution
+
+    private struct ResolvedTool {
+        let content: String
+        let isError: Bool
+        let kill: Bool
+    }
+
+    private func resolveToolUse(_ use: AssistantMessage.ToolUse) async -> ResolvedTool {
+        // Parse the input JSON into a flat [String: String] for the broker.
+        let argsAny = (try? JSONSerialization.jsonObject(with: use.inputJSON)) as? [String: Any] ?? [:]
+        var args: [String: String] = [:]
+        for (k, v) in argsAny {
+            if let s = v as? String { args[k] = s }
+        }
+
+        let call = ToolCall(tool: use.name, args: args)
+
+        // Layer 1: capability check (instant deny if not granted).
+        switch broker.authorize(call) {
+        case .deny(let reason):
+            return ResolvedTool(
+                content: "<tool_result source=\"untrusted\">Permission denied: \(reason)</tool_result>",
+                isError: true,
+                kill: false
+            )
+        case .approve:
+            break
+        }
+
+        // Layer 2: per-call approval (cached if user picked "session" before).
+        let approvalKey = callKey(call)
+        if sessionApprovedKeys.contains(approvalKey) {
+            FileHandle.standardError.write(Data("[approval] cached for this session: \(call.tool)\n".utf8))
+        } else {
+            switch await approve(call) {
+            case .once:
+                break
+            case .session:
+                sessionApprovedKeys.insert(approvalKey)
+            case .deny:
+                return ResolvedTool(
+                    content: "<tool_result source=\"untrusted\">User denied this tool call.</tool_result>",
+                    isError: true,
+                    kill: false
+                )
+            case .denyAndKill:
+                return ResolvedTool(
+                    content: "<tool_result source=\"untrusted\">User denied this tool call and terminated the session.</tool_result>",
+                    isError: true,
+                    kill: true
+                )
+            }
+        }
+
+        // Layer 3: execute the tool under sandbox-exec.
+        FileHandle.standardError.write(Data("[tool] \(call.tool) invoked under sandbox-exec\n".utf8))
+        return await invokeToolRunner(toolName: call.tool, argsJSON: use.inputJSON)
+    }
+
+    private func callKey(_ call: ToolCall) -> String {
+        let sorted = call.args.sorted { $0.key < $1.key }
+        let argsString = sorted.map { "\($0.key)=\($0.value)" }.joined(separator: "&")
+        return "\(call.tool)::\(argsString)"
+    }
+
+    private func invokeToolRunner(toolName: String, argsJSON: Data) async -> ResolvedTool {
+        // ToolRunner's switch expects dot-style names ("fs.read"). Map back.
+        let internalName: String
+        switch toolName {
+        case "fs_read": internalName = "fs.read"
+        case "fs_write": internalName = "fs.write"
+        default: internalName = toolName
+        }
+
+        // Build the tool call JSON ToolRunner expects: {"tool":..., "args":{...}}.
+        let argsObj = (try? JSONSerialization.jsonObject(with: argsJSON)) ?? [:]
+        let toolCallObj: [String: Any] = [
+            "tool": internalName,
+            "args": argsObj,
+        ]
+        guard let toolCallData = try? JSONSerialization.data(withJSONObject: toolCallObj) else {
+            return ResolvedTool(
+                content: "<tool_result source=\"untrusted\">Failed to build tool call JSON.</tool_result>",
+                isError: true,
+                kill: false
+            )
+        }
+
+        // Spawn /usr/bin/sandbox-exec ... /path/to/ToolRunner.
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/sandbox-exec")
+        process.arguments = [
+            "-D", "WORKSPACE=\(session.workspacePath)",
+            "-D", "BUILDDIR=\(session.buildDirPath)",
+            "-f", session.sandboxProfilePath,
+            session.toolRunnerPath,
+        ]
+
+        // ToolRunner reads SHELLFISH_WORKSPACE for its application-level path check.
+        var env = ProcessInfo.processInfo.environment
+        env["SHELLFISH_WORKSPACE"] = session.workspacePath
+        process.environment = env
+
+        let stdinPipe = Pipe()
+        let stdoutPipe = Pipe()
+        let stderrPipe = Pipe()
+        process.standardInput = stdinPipe
+        process.standardOutput = stdoutPipe
+        process.standardError = stderrPipe
+
+        do {
+            try process.run()
+        } catch {
+            return ResolvedTool(
+                content: "<tool_result source=\"untrusted\">Failed to launch ToolRunner: \(error)</tool_result>",
+                isError: true,
+                kill: false
+            )
+        }
+
+        try? stdinPipe.fileHandleForWriting.write(contentsOf: toolCallData)
+        try? stdinPipe.fileHandleForWriting.close()
+
+        process.waitUntilExit()
+
+        let stdoutData = stdoutPipe.fileHandleForReading.readDataToEndOfFile()
+        let exit = process.terminationStatus
+        let stdoutString = String(data: stdoutData, encoding: .utf8) ?? ""
+
+        // Parse ToolRunner's JSON {success, output, error}.
+        if let parsed = try? JSONSerialization.jsonObject(with: stdoutData) as? [String: Any] {
+            let success = parsed["success"] as? Bool ?? false
+            let output = parsed["output"] as? String
+            let errorMsg = parsed["error"] as? String
+            if success, let output = output {
+                let wrapped = "<tool_result source=\"untrusted\" origin=\"\(session.workspacePath)\">\n\(output)\n</tool_result>"
+                return ResolvedTool(content: wrapped, isError: false, kill: false)
+            } else {
+                return ResolvedTool(
+                    content: "<tool_result source=\"untrusted\">Tool failed: \(errorMsg ?? "unknown error")</tool_result>",
+                    isError: true,
+                    kill: false
+                )
+            }
+        }
+
+        // ToolRunner crashed before emitting a result.
+        return ResolvedTool(
+            content: "<tool_result source=\"untrusted\">ToolRunner exited \(exit) with no result. stdout: \(stdoutString)</tool_result>",
+            isError: true,
+            kill: false
+        )
+    }
+}
