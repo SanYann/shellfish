@@ -72,6 +72,12 @@ public struct PermissionBroker: Sendable {
             return capabilities.fsWrite.isEmpty
                 ? .deny(reason: "fs.write not granted to this session")
                 : .approve
+        // fs.list reuses the fs.read capability — listing a directory is a
+        // strict subset of reading from it.
+        case "fs.list", "fs_list":
+            return capabilities.fsRead.isEmpty
+                ? .deny(reason: "fs.read not granted to this session (fs.list requires it)")
+                : .approve
         case "http_fetch":
             return capabilities.netFetch.isEmpty
                 ? .deny(reason: "net.fetch not granted to this session")

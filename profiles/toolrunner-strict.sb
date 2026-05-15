@@ -55,6 +55,11 @@
 (allow file-read* (subpath (param "WORKSPACE")))
 (allow file-read* (subpath (param "BUILDDIR")))
 
+;; Writes inside the workspace are allowed (fs.write). The default-deny
+;; from line 26 keeps writes everywhere else off-limits; tmp + var/folders
+;; carve-outs above cover Swift runtime caches.
+(allow file-write* (subpath (param "WORKSPACE")))
+
 ;; THE NETWORK ARCHITECTURAL CLAIM (carries S1 forward):
 (deny network*)
 (deny network-outbound)

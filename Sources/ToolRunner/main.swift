@@ -73,6 +73,79 @@ case "fs.read":
         exit(1)
     }
 
+case "fs.write":
+    guard let requested = call.args["path"] else {
+        emit(ToolResult(success: false, output: nil, error: "Missing path"))
+        exit(2)
+    }
+    guard let content = call.args["content"] else {
+        emit(ToolResult(success: false, output: nil, error: "Missing content"))
+        exit(2)
+    }
+    guard let workspace = ProcessInfo.processInfo.environment["SHELLFISH_WORKSPACE"] else {
+        emit(ToolResult(success: false, output: nil, error: "SHELLFISH_WORKSPACE not set"))
+        exit(2)
+    }
+    let canonRequested = canonicalize(requested)
+    let canonWorkspace = canonicalize(workspace)
+    if !isInsideWorkspace(requested, workspace: workspace) {
+        emit(ToolResult(
+            success: false,
+            output: nil,
+            error: "Path '\(canonRequested)' is outside session workspace '\(canonWorkspace)'"
+        ))
+        exit(1)
+    }
+    do {
+        try content.write(toFile: canonRequested, atomically: true, encoding: .utf8)
+        emit(ToolResult(success: true, output: "Wrote \(content.utf8.count) bytes to \(canonRequested)", error: nil))
+        exit(0)
+    } catch {
+        emit(ToolResult(success: false, output: nil, error: "Write failed: \(error)"))
+        exit(1)
+    }
+
+case "fs.list":
+    guard let workspace = ProcessInfo.processInfo.environment["SHELLFISH_WORKSPACE"] else {
+        emit(ToolResult(success: false, output: nil, error: "SHELLFISH_WORKSPACE not set"))
+        exit(2)
+    }
+    // path is optional — defaults to the workspace root.
+    let requested = call.args["path"].flatMap { $0.isEmpty ? nil : $0 } ?? workspace
+    let canonRequested = canonicalize(requested)
+    let canonWorkspace = canonicalize(workspace)
+    if !isInsideWorkspace(requested, workspace: workspace) {
+        emit(ToolResult(
+            success: false,
+            output: nil,
+            error: "Path '\(canonRequested)' is outside session workspace '\(canonWorkspace)'"
+        ))
+        exit(1)
+    }
+    do {
+        let entries = try FileManager.default.contentsOfDirectory(atPath: canonRequested)
+        var listing: [[String: Any]] = []
+        for name in entries.sorted() {
+            let full = "\(canonRequested)/\(name)"
+            var isDir: ObjCBool = false
+            FileManager.default.fileExists(atPath: full, isDirectory: &isDir)
+            let attrs = try? FileManager.default.attributesOfItem(atPath: full)
+            let size = (attrs?[.size] as? NSNumber)?.intValue ?? 0
+            listing.append([
+                "name": name,
+                "isDir": isDir.boolValue,
+                "size": size,
+            ])
+        }
+        let data = try JSONSerialization.data(withJSONObject: listing, options: [.prettyPrinted, .sortedKeys])
+        let output = String(data: data, encoding: .utf8) ?? "[]"
+        emit(ToolResult(success: true, output: output, error: nil))
+        exit(0)
+    } catch {
+        emit(ToolResult(success: false, output: nil, error: "List failed: \(error)"))
+        exit(1)
+    }
+
 case "http_fetch":
     guard let urlString = call.args["url"], let url = URL(string: urlString) else {
         emit(ToolResult(success: false, output: nil, error: "Missing or invalid url"))

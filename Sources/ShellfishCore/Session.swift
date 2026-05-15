@@ -70,18 +70,21 @@ public final class ConversationLoop: @unchecked Sendable {
     private let provider: AnthropicProvider
     private let broker: PermissionBroker
     private let approve: ApprovalCallback
+    private let audit: AuditLogger?
     private var transcript: [ConversationTurn] = []
     private var sessionApprovedKeys: Set<String> = []
 
     public init(
         session: Session,
         provider: AnthropicProvider,
-        approvalCallback: @escaping ApprovalCallback
+        approvalCallback: @escaping ApprovalCallback,
+        auditLogger: AuditLogger? = nil
     ) {
         self.session = session
         self.provider = provider
         self.broker = PermissionBroker(capabilities: session.capabilities)
         self.approve = approvalCallback
+        self.audit = auditLogger
     }
 
     /// Result of a single user turn — final assistant text plus any per-tool
@@ -169,32 +172,38 @@ public final class ConversationLoop: @unchecked Sendable {
         // Layer 1: capability check (instant deny if not granted).
         switch broker.authorize(call) {
         case .deny(let reason):
+            audit?.logCapabilityCheck(tool: call.tool, args: call.args, approved: false, reason: reason)
             return ResolvedTool(
                 content: "<tool_result source=\"untrusted\">Permission denied: \(reason)</tool_result>",
                 isError: true,
                 kill: false
             )
         case .approve:
-            break
+            audit?.logCapabilityCheck(tool: call.tool, args: call.args, approved: true, reason: nil)
         }
 
         // Layer 2: per-call approval (cached if user picked "session" before).
         let approvalKey = callKey(call)
         if sessionApprovedKeys.contains(approvalKey) {
             FileHandle.standardError.write(Data("[approval] cached for this session: \(call.tool)\n".utf8))
+            audit?.logUserApproval(tool: call.tool, args: call.args, decision: "session_cached", cached: true)
         } else {
-            switch await approve(call) {
+            let decision = await approve(call)
+            switch decision {
             case .once:
-                break
+                audit?.logUserApproval(tool: call.tool, args: call.args, decision: "once", cached: false)
             case .session:
+                audit?.logUserApproval(tool: call.tool, args: call.args, decision: "session", cached: false)
                 sessionApprovedKeys.insert(approvalKey)
             case .deny:
+                audit?.logUserApproval(tool: call.tool, args: call.args, decision: "deny", cached: false)
                 return ResolvedTool(
                     content: "<tool_result source=\"untrusted\">User denied this tool call.</tool_result>",
                     isError: true,
                     kill: false
                 )
             case .denyAndKill:
+                audit?.logUserApproval(tool: call.tool, args: call.args, decision: "deny_and_kill", cached: false)
                 return ResolvedTool(
                     content: "<tool_result source=\"untrusted\">User denied this tool call and terminated the session.</tool_result>",
                     isError: true,
@@ -205,7 +214,15 @@ public final class ConversationLoop: @unchecked Sendable {
 
         // Layer 3: execute the tool under sandbox-exec.
         FileHandle.standardError.write(Data("[tool] \(call.tool) invoked under sandbox-exec\n".utf8))
-        return await invokeToolRunner(toolName: call.tool, argsJSON: use.inputJSON)
+        let result = await invokeToolRunner(toolName: call.tool, argsJSON: use.inputJSON)
+        audit?.logToolResult(
+            tool: call.tool,
+            args: call.args,
+            success: !result.isError,
+            output: result.isError ? nil : result.content,
+            error: result.isError ? result.content : nil
+        )
+        return result
     }
 
     private func callKey(_ call: ToolCall) -> String {
@@ -218,9 +235,10 @@ public final class ConversationLoop: @unchecked Sendable {
         // ToolRunner's switch expects dot-style names ("fs.read"). Map back.
         let internalName: String
         switch toolName {
-        case "fs_read": internalName = "fs.read"
+        case "fs_read":  internalName = "fs.read"
         case "fs_write": internalName = "fs.write"
-        default: internalName = toolName
+        case "fs_list":  internalName = "fs.list"
+        default:         internalName = toolName
         }
 
         // Build the tool call JSON ToolRunner expects: {"tool":..., "args":{...}}.

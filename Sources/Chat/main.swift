@@ -37,41 +37,84 @@ struct Main {
             }
         }
 
-        let fsReadTool: ToolDef
+        let tools: [ToolDef]
         do {
-            fsReadTool = try ToolDef(
-                name: "fs_read",
-                description: """
-                    Read the contents of a text file from the session workspace. Returns
-                    the file's text contents on success. Only paths inside the workspace
-                    are allowed; anything outside will be rejected.
-                    """,
-                inputSchema: [
-                    "type": "object",
-                    "properties": [
-                        "path": [
-                            "type": "string",
-                            "description": "Absolute path to the file (must be inside the workspace).",
+            tools = [
+                try ToolDef(
+                    name: "fs_read",
+                    description: """
+                        Read the contents of a text file from the session workspace.
+                        Only paths inside the workspace are allowed.
+                        """,
+                    inputSchema: [
+                        "type": "object",
+                        "properties": [
+                            "path": [
+                                "type": "string",
+                                "description": "Absolute path inside the workspace.",
+                            ],
                         ],
-                    ],
-                    "required": ["path"],
-                ]
-            )
+                        "required": ["path"],
+                    ]
+                ),
+                try ToolDef(
+                    name: "fs_write",
+                    description: """
+                        Write text content to a file in the session workspace, replacing
+                        any existing contents. Only paths inside the workspace are allowed.
+                        """,
+                    inputSchema: [
+                        "type": "object",
+                        "properties": [
+                            "path": [
+                                "type": "string",
+                                "description": "Absolute path inside the workspace.",
+                            ],
+                            "content": [
+                                "type": "string",
+                                "description": "Full text content to write.",
+                            ],
+                        ],
+                        "required": ["path", "content"],
+                    ]
+                ),
+                try ToolDef(
+                    name: "fs_list",
+                    description: """
+                        List the entries of a directory in the session workspace.
+                        Returns JSON: [{name, isDir, size}, ...]. If path is omitted,
+                        lists the workspace root.
+                        """,
+                    inputSchema: [
+                        "type": "object",
+                        "properties": [
+                            "path": [
+                                "type": "string",
+                                "description": "Absolute path inside the workspace (optional).",
+                            ],
+                        ],
+                        "required": [],
+                    ]
+                ),
+            ]
         } catch {
-            FileHandle.standardError.write(Data("Failed to build tool def: \(error)\n".utf8))
+            FileHandle.standardError.write(Data("Failed to build tool defs: \(error)\n".utf8))
             exit(2)
         }
 
         let session = Session(
             workspacePath: workspacePath,
-            capabilities: Capabilities(fsRead: [workspacePath]),
-            tools: [fsReadTool],
+            capabilities: Capabilities(
+                fsRead: [workspacePath],
+                fsWrite: [workspacePath]
+            ),
+            tools: tools,
             systemPrompt: """
                 You are a helpful assistant operating inside a sandboxed workspace.
-                Your only tool is fs_read. The workspace is at: \(workspacePath).
-                When the user asks about file contents, use fs_read with an absolute
-                path inside that workspace. Do not invent file contents — if a read
-                is denied, say so plainly.
+                The workspace is at: \(workspacePath).
+                Your tools: fs_read, fs_write, fs_list. All paths must be absolute
+                and inside the workspace; reads/writes outside are denied.
+                Do not invent file contents — if a tool call fails, say so plainly.
                 """,
             sandboxProfilePath: sandboxProfilePath,
             toolRunnerPath: toolRunnerPath,
@@ -89,17 +132,30 @@ struct Main {
             exit(2)
         }
 
+        let audit: AuditLogger?
+        do {
+            audit = try AuditLogger(sessionId: session.id)
+        } catch {
+            FileHandle.standardError.write(Data("Audit logger init failed (\(error)) — continuing without audit.\n".utf8))
+            audit = nil
+        }
+
         let loop = ConversationLoop(
             session: session,
             provider: provider,
-            approvalCallback: approve
+            approvalCallback: approve,
+            auditLogger: audit
         )
 
-        print("=== Shellfish Chat (Stage 4 Phase 4.2) ===")
+        print("=== Shellfish Chat (Stage 4 Phase 4.4) ===")
         print("Model:     claude-opus-4-7")
         print("Workspace: \(workspacePath)")
         print("Profile:   \(sandboxProfilePath)")
-        print("Tools:     fs_read")
+        print("Tools:     fs_read, fs_write, fs_list")
+        if let path = audit?.logPath {
+            print("Audit:     \(path)")
+        }
+        print("Session:   \(session.id)")
         print("Type your message, then Enter. Type 'exit' or Ctrl-D to quit.")
         print("")
 
