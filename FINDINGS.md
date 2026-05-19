@@ -149,7 +149,7 @@ swift build
 
 ---
 
-## Cumulative status (after Stages 0 + 1 + 3 of staged plan)
+## Cumulative status (after Stages 0 + 1 + 3 + Stage 4 headless work)
 
 Three security claims now mechanically verified on macOS 26:
 
@@ -159,13 +159,53 @@ Three security claims now mechanically verified on macOS 26:
 
 The three primitives are independent — each tests a different chokepoint in the architecture. They are the floor under everything in the threat model.
 
-### Honest gaps
+The **headless kernel** (Stage 4 Phases 4.1–4.4) now sits on top of them: a real Claude Opus 4.7 conversation, brokered, sandboxed, audit-logged, with three working tools.
+
+---
+
+## Stage 4 — Headless kernel (Phases 4.1–4.4)
+
+**Scope:** prove the threat-model §5 process model is implementable and runs end-to-end with a real LLM. Each of the three primitives below is exercised inside a real session every time `Chat` runs.
+
+### What was built
+
+| Phase | Component | What it does |
+|---|---|---|
+| 4.1 | `AnthropicProvider` (ShellfishCore) | Raw HTTP client for `POST /v1/messages`. Model: `claude-opus-4-7`. Handles text + tool_use blocks. ~150 lines, no SDK dependency. |
+| 4.2 | `Session` + `ConversationLoop` (ShellfishCore) | Drives turns of LLM → broker → sandboxed ToolRunner → tool_result → LLM, until `stop_reason == end_turn`. Session-scoped "always" approval cache. |
+| 4.2 | `Chat` (executable) | Interactive REPL. Reads user prompts from stdin, prints final assistant text, shows native-ish approval prompts. |
+| 4.3 | `fs.write` + `fs.list` (ToolRunner) | Two new sandboxed tools. Workspace-bounded, canonicalized, capability-gated. Strict profile updated to allow writes inside WORKSPACE only. |
+| 4.4 | `AuditLogger` (ShellfishCore) | Append-only JSONL at `~/.shellfish/audit.jsonl`. Records `capability_check`, `user_approval`, `tool_result` per call. SHA-256 hash + byte count on outputs (not content). |
+
+### What this validates that the PoCs alone did not
+
+The PoCs (S1, S2, S4) used a fake LLM that complies with injection. The headless kernel runs with a **real Claude Opus 4.7** in the loop, and every architectural component (broker, sandbox, audit log, untrusted-content envelope) is a real running component, not a stub.
+
+Specifically:
+
+- **§5.1 process model** is a working program. UI → broker → sandboxed ToolRunner is real subprocess boundaries with real JSON IPC.
+- **§5.4 untrusted-content envelope** wraps every tool result the model sees: `<tool_result source="untrusted" origin="...">...</tool_result>`.
+- **§5.5 audit log** appends real JSONL entries with SHA-256 result hashes. Tampering with what Claude saw vs. what we recorded is detectable post-hoc.
+- **§5.2 broker** is now a real two-layer gate: capability check (instant deny) → user approval prompt (with session-scoped caching keyed on `(tool, args)`).
+
+### Where Phase 4 stops
+
+What's still out:
+
+- **No GUI yet.** CLI only. Phase 4.5 adds the SwiftUI shell.
+- **One provider.** Anthropic only. Multi-provider (OpenAI, Mistral) is Stage 5.
+- **No MCP support.** Stage 5.
+- **No memory export/import.** §4.2 of the threat model is unimplemented.
+- **In-process broker.** Threat model §5.1 wants the broker as a separate XPC service. The PoC keeps it in-process; XPC promotion is v1 hardening.
+- **Audit log is JSONL, not SQLite.** Stage 8 hardening.
+
+### Honest gaps (still open from earlier)
 
 - **`sandbox-exec` deprecation.** Still flagged by Apple. The strict profile working today does not guarantee it works on macOS 27. The architectural answer is App Sandbox + dynamic entitlements; that work begins when v1 begins.
-- **The strict profile is "deny user data," not "default-deny everything."** A truly default-deny filesystem profile that also runs Swift binaries cleanly is probably not achievable on modern macOS without enumerating paths that change every release. The current profile captures the architectural intent (no read of user data outside workspace) without that maintenance cost. Documented as a deliberate trade-off, not a hidden weakness.
-- **Real LLM behavior unmeasured.** All three PoCs use a worst-case fake LLM that complies with injection. No data on actual model behavior under these scenarios.
+- **The strict profile is "deny user data," not "default-deny everything."** A truly default-deny filesystem profile that also runs Swift binaries cleanly is probably not achievable on modern macOS without enumerating paths that change every release. The current profile captures the architectural intent (no read of user data outside workspace) without that maintenance cost.
+- **Real LLM behavior partially measured.** In the headless kernel demo, `claude-opus-4-7` refused upstream when asked to read `~/.ssh/id_rsa` — model alignment caught it before the broker or sandbox ever ran. That's a PASS but means the lower layers weren't *exercised* by a real LLM for that particular attack. S1/S2/S4 still cover those paths mechanically with the fake LLM.
 
 ### Recommended next decisions
 
-- **Stop or continue?** The staged plan's decision point applies even more strongly now: with three PoCs passing AND the strict-profile question resolved, this is a coherent credibility asset. Continuing means committing to Stage 4 (3–4 months for a vertical slice).
-- **Cheapest "before stopping" tasks:** add LICENSE, edit ESSAY into your voice, share the repo link with one person whose technical judgment you trust.
+- **Stop or continue to Phase 4.5 (SwiftUI shell)?** The staged plan's decision point applies more strongly now: with the headless kernel landing, this is a complete coherent artifact. Phase 4.5 is the longest remaining phase (3–4 weeks) and a different kind of work (UI / event loop / window lifecycle).
+- **Cheapest "before deciding" tasks:** add LICENSE, edit ESSAY into your voice, run the demo for one person whose technical judgment you trust. Their reaction tells you whether Phase 4.5 is worth the time.

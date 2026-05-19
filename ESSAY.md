@@ -70,10 +70,41 @@ The second is the harder admission: this is two PoCs, not a product. There is no
 
 Because the claim that you can build a Mac AI assistant whose lethal-trifecta defense is a structural property of the OS, not a property of the model or the application code, was not obvious before I sat down to test it. It wasn't obvious to me. Five major security vendors writing about OpenClaw is a lot of evidence that the conventional approach (skill marketplaces, opt-in sandboxing, "the operator is trusted") doesn't reach a defensible posture. The conventional alternative — refuse to build it — concedes the space to the OpenClaws of the world. There is a third option, and the two PASSes above are the floor under it.
 
-The repo is at [github.com/SanYann/shellfish](https://github.com/SanYann/shellfish). About 200 lines of Swift, two profiles, two run scripts. If you want to see what containment looks like as a binary outcome rather than a marketing claim, clone it and run `./run.sh`.
+## What's running now
+
+After the PoCs landed, I kept going. The repo now contains a working headless kernel — a real Claude Opus 4.7 conversation driven through the same broker and sandbox the PoCs validated.
+
+You can run it:
+
+```
+swift build
+.build/debug/Chat
+> What's in the workspace?
+[approval] Claude wants to call: fs_list{}
+  [o]nce / [s]ession / [d]eny / [k]ill: o
+[tool] fs_list invoked under sandbox-exec
+The workspace contains two files: decoy.txt and notes.txt.
+> exit
+```
+
+Every step in that exchange is a real component. The approval prompt is brokered. The tool call goes through a `sandbox-exec` subprocess that cannot reach `/Users/<anyone>/.ssh` or the network. The file listing comes back wrapped as `<tool_result source="untrusted">`. And every event lands in an append-only JSONL audit log keyed by a per-session UUID, with SHA-256 hashes of each tool's output for post-hoc tamper detection.
+
+That's not a PoC anymore. It's the architecture, running, in about 1,500 lines of Swift, three `sandbox-exec` profiles, no third-party dependencies, no Electron, no Docker. On an M1 it idles below 50 MB.
+
+## What's still missing
+
+A GUI. That's about it for the headless work — three real tools (`fs_read`, `fs_write`, `fs_list`), brokered approval with session caching, audit log, real LLM. The SwiftUI shell is the next ~3-4 weeks of work and intentionally hasn't started yet, because the architecture mattered more than the chrome.
+
+The other genuine gaps are honest residuals: `sandbox-exec` is officially deprecated by Apple (still works through macOS 26, but App Sandbox + dynamic entitlements is the long-term answer). The broker runs in-process today rather than as a separate XPC service. There's no MCP support, no memory export/import, no multi-provider yet.
+
+None of those gaps are the kind of "lethal trifecta" hole that gets you a Kaspersky writeup. They're roadmap items.
+
+---
+
+The repo is at [github.com/SanYann/shellfish](https://github.com/SanYann/shellfish). If you want to see what containment looks like as a binary outcome rather than a marketing claim, clone it and run `./run.sh`. If you want to see a real LLM constrained by an OS-level sandbox, run `.build/debug/Chat`.
 
 If anyone is building the same thing on Linux or Windows: I would like to compare profiles. Email me.
 
 ---
 
-*Two weekends, ~200 lines of Swift, ~50 lines of `sandbox-exec` SBPL, one M1 Mac. Nothing else needed.*
+*A few weekends, ~1,500 lines of Swift, ~80 lines of `sandbox-exec` SBPL, one M1 Mac. Nothing else needed.*

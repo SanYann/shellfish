@@ -12,5 +12,6 @@ let package = Package(
         .executableTarget(name: "ToolRunner", path: "Sources/ToolRunner"),
         .executableTarget(name: "AttackerObserver", path: "Sources/AttackerObserver"),
         .executableTarget(name: "Chat", dependencies: ["ShellfishCore"], path: "Sources/Chat"),
+        .executableTarget(name: "ShellfishApp", dependencies: ["ShellfishCore"], path: "Sources/ShellfishApp"),
     ]
 )
