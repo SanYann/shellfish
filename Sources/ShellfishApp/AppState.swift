@@ -58,8 +58,13 @@ final class AppState: ObservableObject {
         let toolRunnerPath = "\(cwd)/.build/debug/ToolRunner"
         let buildDirPath = "\(cwd)/.build"
 
+        // Create the workspace on first run (fresh clones don't ship one).
+        try? FileManager.default.createDirectory(
+            atPath: workspacePath,
+            withIntermediateDirectories: true
+        )
+
         for (label, path) in [
-            ("workspace", workspacePath),
             ("sandbox profile", sandboxProfilePath),
             ("ToolRunner binary", toolRunnerPath),
         ] {

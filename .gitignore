@@ -22,3 +22,6 @@ Package.resolved
 # Workspace files are scratch fixtures created at runtime by run scripts
 # and by Chat sessions — never check them in.
 workspaces/
+
+# Local Claude Code settings
+.claude/

@@ -1,78 +1,144 @@
-# Shellfish — proof of concept
+# Shellfish
 
-A two-weekend proof that the core security claim of a sandboxed, capability-bound Mac AI assistant is mechanically real on macOS 26.
+A security-first, local, open-source macOS AI assistant. Chat with a frontier
+LLM and let it use tools — filesystem, and (later) shell, web, MCP — where the
+defense against prompt injection is a **structural property of the OS**, not a
+prompt or an application-level allowlist.
 
-This is not a product. It is the floor under one. If the PoCs in here failed, building the product would be a waste of time. They pass.
+This repo is the architecture, proven and running. It is honest about what it
+does not yet do (see [Status](#status)).
 
-## What this proves
+## Why this exists
 
-Two scenarios, each a small CLI harness that exits 0/1 based on whether a simulated attack succeeds.
+OpenClaw is a popular personal-AI-assistant project that, in Q1 2026, was
+publicly criticized for security holes by Microsoft, Kaspersky, Cisco,
+CrowdStrike, and Sophos. Sophos named the core problem the **lethal trifecta**:
+an agent that simultaneously has (1) private-data read, (2) open outbound
+network, and (3) untrusted-content ingestion is catastrophic by construction —
+a prompt injection in an email can exfiltrate your SSH key.
+
+Most proposed fixes are model-level (better system prompts, injection
+detection). Those help; they are not a defense. Shellfish takes the position
+that the defense has to be structural: the agent must be *unable* to combine
+the three legs of the trifecta in one session, regardless of what the model
+decides to do. That's enforced with capability-bound sessions, an OS sandbox
+(`sandbox-exec`), and a permission broker — not with TypeScript allowlists.
+
+Full reasoning: [`docs/threat-model.md`](docs/threat-model.md) (v0.3).
+
+## The security claims, mechanically proven
+
+Three CLI harnesses, each exiting `0`/`1` based on whether a simulated attack
+succeeds. Each has a **negative control** showing the attack lands when the
+defense is removed — so a PASS isn't coincidence.
 
 | | Scenario | Defense | Result |
 |---|---|---|---|
-| **S1** | Sandboxed `ToolRunner` is told by a fake LLM to exfiltrate to `127.0.0.1:9999/exfil` | OS-level `sandbox-exec` denies network egress | **PASS** |
-| **S2** | Malicious MCP response asks agent to run a shell command; fake LLM complies | In-process `PermissionBroker` denies — session has no `shell` capability | **PASS** |
-| **S4** | MCP arg contains `../../../.ssh/id_rsa`-style path traversal | `fs.read` canonicalizes the path and rejects anything outside the session workspace | **PASS** |
-
-Both have negative controls: with the defense removed, the attack reaches the observer. So we know the PASS isn't coincidence.
-
-See [`FINDINGS.md`](FINDINGS.md) for full details — exit codes, observer logs, what isn't proven, what comes next.
-
-## What this does not prove
-
-Honesty matters more than a clean PASS table:
-
-- That a real LLM would actually emit the malicious tool call. The fake LLM is hardcoded to comply with the injection. A real Claude/GPT/Mistral might refuse. The PoC tests *containment if compliance happens*, which is the worst case.
-- That the strict `sandbox-exec` profile would survive Apple deprecating the CLI tool. It works today and gives an OS-level backstop on filesystem and network reads (verified directly — `/bin/cat /Users/...` returns `Operation not permitted` under the profile, the workspace carve-out reads succeed). The architectural answer for a future macOS is App Sandbox + dynamic entitlements; that's a separate spike for v1.
-- That `sandbox-exec` itself will exist in macOS 27+. Apple has marked it deprecated for years. Replacement path is a separate spike.
-- The interactive approval-dialog UX, the export/import signature scheme, the audit log, MCP transport, multi-provider — none of these are in the PoC. They're in the [threat model](../shellfish-threat-model.md) but not validated here.
-
-## How to run
+| **S1** | A worst-case LLM is told to exfiltrate to `127.0.0.1:9999/exfil` | OS-level `sandbox-exec` denies network egress | **PASS** |
+| **S2** | A malicious MCP response asks the agent to run a shell command; the LLM complies | In-process `PermissionBroker` denies — session has no `shell` capability | **PASS** |
+| **S4** | A tool arg contains `../../../.ssh/id_rsa`-style path traversal | `fs_read` canonicalizes the path and rejects anything outside the workspace | **PASS** |
 
 ```sh
-# requires Swift 5.9+ and macOS 13+ (tested on macOS 26 / Apple Silicon)
+swift build
+./run.sh        # S1
+./run-s2.sh     # S2
+./run-s4.sh     # S4
+```
+
+Full details, including what each does *not* prove: [`FINDINGS.md`](FINDINGS.md).
+
+## What's running now
+
+On top of those primitives sits a working headless kernel and a SwiftUI shell —
+a real `claude-opus-4-7` conversation, brokered, sandboxed, and audit-logged.
+
+```sh
+export ANTHROPIC_API_KEY="sk-ant-..."
 swift build
 
-./run.sh                # S1
-./run-s2.sh             # S2
-./run-s4.sh             # S4
+# CLI:
+.build/debug/Chat
+
+# GUI:
+swift run ShellfishApp
 ```
 
-Both should print `PASS` and exit 0.
+In either front-end, a session is created with a minimal capability set
+(filesystem read/write bound to one workspace, no shell, no network). When the
+model requests a tool:
 
-To see the attack actually succeed without the defense:
+1. The `PermissionBroker` checks the session's capabilities (instant deny if not granted).
+2. You're shown an approval prompt (CLI: `o/s/d/k`; GUI: native dialog) — with session-scoped "always" caching.
+3. The tool runs in a `ToolRunner` subprocess under a `sandbox-exec` profile that denies network and any read of `/Users/<anyone>` outside the workspace.
+4. The result is wrapped as `<tool_result source="untrusted">` before the model sees it.
+5. Every step is appended to an audit log at `~/.shellfish/audit.jsonl` (SHA-256 hash of each output, for tamper detection).
 
-```sh
-SHELLFISH_PROFILE=$(pwd)/profiles/toolrunner-allow-all.sb ./run.sh   # S1 negative control
-```
+Try asking it to read a file in the workspace (it'll ask permission), then ask
+it to read `~/.ssh/id_rsa` (it can't — the path is outside the workspace, and
+the sandbox would block it even if the app code had a bug).
 
 ## Layout
 
 ```
 .
 ├── Package.swift
-├── FINDINGS.md                          ← S1 + S2 results, what they validate
-├── run.sh / run-s2.sh
-├── Sources/
-│   ├── Harness/                         ← S1 orchestrator
-│   ├── HarnessS2/                       ← S2 with in-process broker
-│   ├── HarnessS4/                       ← S4 with path-canonicalization test
-│   ├── ToolRunner/                      ← http_fetch + fs.read (sandboxed)
-│   └── AttackerObserver/                ← logs incoming /exfil hits
-└── profiles/
-    ├── toolrunner.sb                    ← primary, allow-default + deny-network
-    ├── toolrunner-allow-all.sb          ← S1 negative control
-    └── toolrunner-strict.sb             ← stretch goal, currently INCONCLUSIVE
+├── LICENSE                                 ← MIT
+├── README.md
+├── FINDINGS.md                             ← PoC results + headless-kernel writeup
+├── ESSAY.md                                ← draft "what containment looks like" essay
+├── run.sh / run-s2.sh / run-s4.sh          ← the three security harnesses
+├── docs/
+│   ├── threat-model.md                     ← the heart of the project (v0.3)
+│   ├── poc-plan.md
+│   ├── development-plan.md                  ← staged decision plan
+│   └── stage4-plan.md                       ← step-by-step build plan for the app
+├── profiles/
+│   ├── toolrunner.sb                        ← S1 primary: allow-default + deny-network
+│   ├── toolrunner-allow-all.sb              ← S1 negative control
+│   └── toolrunner-strict.sb                 ← production-shape: deny user data + deny network
+└── Sources/
+    ├── ShellfishCore/                       ← shared library: provider, session loop, broker, audit
+    │   ├── AnthropicProvider.swift          ← raw HTTP client for claude-opus-4-7
+    │   ├── Session.swift                     ← ConversationLoop: LLM → broker → ToolRunner → result
+    │   ├── Types.swift                       ← Capabilities, ToolCall, PermissionBroker
+    │   └── AuditLogger.swift                 ← append-only JSONL audit log
+    ├── ToolRunner/                          ← sandboxed tool executor (fs_read/write/list, http_fetch)
+    ├── Chat/                                 ← interactive CLI front-end
+    ├── ShellfishApp/                         ← SwiftUI front-end (window + native approval dialog)
+    ├── AttackerObserver/                     ← test-only HTTP listener for exfil detection
+    └── Harness / HarnessS2 / HarnessS4/      ← the three PoC harnesses
 ```
-
-## Context
-
-The motivation, threat model, and architecture live in [`docs/threat-model.md`](docs/threat-model.md) (v0.3). The PoC plan that this implements is in [`docs/poc-plan.md`](docs/poc-plan.md). The staged decision plan is in [`docs/development-plan.md`](docs/development-plan.md).
-
-Short version: OpenClaw is a personal-AI-assistant project that, in Q1 2026, was publicly criticized for security holes by Microsoft, Kaspersky, Cisco, CrowdStrike, and Sophos. Sophos called it the "lethal trifecta" — an agent with private-data read + open network + untrusted-content ingestion is catastrophic by construction. Shellfish is an attempt to design those three out structurally rather than warn the user about them.
 
 ## Status
 
-**Stage 0 + 1 of the staged plan are complete.** The decision gate is: does the work to date justify continuing to Stage 4 (a real vertical slice, ~3–4 months of evenings and weekends)?
+**Working:** the three security PoCs, the headless kernel (real Anthropic
+conversation, broker, sandbox, audit log), three filesystem tools, and a
+minimal SwiftUI window.
 
-That decision is for me, not the repo. The repo is what makes the decision possible.
+**Not here yet** (roadmap, not hidden holes):
+
+- No menu-bar mode, no streaming, no inline tool rendering — the GUI is a v0.1.
+- One provider (Anthropic). OpenAI + Mistral are designed (`docs/threat-model.md` §4.1) but unimplemented.
+- No MCP support, no memory export/import.
+- The broker runs in-process; the threat model wants it as a separate XPC service (v1 hardening).
+- `sandbox-exec` is officially deprecated by Apple. It works through macOS 26; App Sandbox + dynamic entitlements is the long-term path.
+- No code signing / notarization — you build it yourself with `swift build`.
+
+None of those gaps is a lethal-trifecta hole. They're the difference between
+"the architecture runs" and "your non-technical friend can install it."
+
+## Requirements
+
+- macOS 13+ (developed and tested on macOS 26 / Apple Silicon).
+- Swift 5.9+.
+- An Anthropic API key in `ANTHROPIC_API_KEY` for the `Chat` / `ShellfishApp` front-ends. (The PoCs need no key.)
+
+## License
+
+MIT. See [`LICENSE`](LICENSE).
+
+## Contributing / security
+
+This is an early personal project. Issues and discussion are welcome; response
+times are best-effort. If you find a way to make the agent combine the lethal
+trifecta in one session, that's the bug that matters most — please open an issue.

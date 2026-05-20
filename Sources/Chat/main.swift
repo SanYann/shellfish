@@ -25,9 +25,14 @@ struct Main {
         let toolRunnerPath = "\(cwd)/.build/debug/ToolRunner"
         let buildDirPath = "\(cwd)/.build"
 
-        // Sanity checks.
+        // Create the workspace on first run (fresh clones don't ship one).
+        try? FileManager.default.createDirectory(
+            atPath: workspacePath,
+            withIntermediateDirectories: true
+        )
+
+        // Sanity checks for things that must already exist (built artifacts).
         for (label, path) in [
-            ("workspace", workspacePath),
             ("sandbox profile", sandboxProfilePath),
             ("ToolRunner binary", toolRunnerPath),
         ] {
