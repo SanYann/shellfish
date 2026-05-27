@@ -63,6 +63,20 @@ public enum ApprovalDecision: Sendable {
 
 public typealias ApprovalCallback = @Sendable (ToolCall) async -> ApprovalDecision
 
+// MARK: - Turn events
+
+/// Fired by ConversationLoop during a turn so the UI can render tool
+/// activity inline in the chat (not only behind an approval sheet).
+public enum TurnEvent: Sendable {
+    /// A tool call has been approved and is about to run.
+    case toolCall(name: String, args: [String: String], id: String)
+    /// A tool call finished. `summary` is a short string for the UI
+    /// (full content goes through the model, not here).
+    case toolResult(toolUseId: String, success: Bool, summary: String)
+}
+
+public typealias EventCallback = @Sendable (TurnEvent) async -> Void
+
 // MARK: - Conversation loop
 
 public final class ConversationLoop: @unchecked Sendable {
@@ -70,6 +84,7 @@ public final class ConversationLoop: @unchecked Sendable {
     private let provider: AnthropicProvider
     private let broker: PermissionBroker
     private let approve: ApprovalCallback
+    private let event: EventCallback?
     private let audit: AuditLogger?
     private var transcript: [ConversationTurn] = []
     private var sessionApprovedKeys: Set<String> = []
@@ -78,12 +93,14 @@ public final class ConversationLoop: @unchecked Sendable {
         session: Session,
         provider: AnthropicProvider,
         approvalCallback: @escaping ApprovalCallback,
+        eventCallback: EventCallback? = nil,
         auditLogger: AuditLogger? = nil
     ) {
         self.session = session
         self.provider = provider
         self.broker = PermissionBroker(capabilities: session.capabilities)
         self.approve = approvalCallback
+        self.event = eventCallback
         self.audit = auditLogger
     }
 
@@ -154,7 +171,8 @@ public final class ConversationLoop: @unchecked Sendable {
     // MARK: - Tool resolution
 
     private struct ResolvedTool {
-        let content: String
+        let content: String   // <tool_result>...</tool_result> envelope for the model
+        let summary: String   // short string for the UI event stream
         let isError: Bool
         let kill: Bool
     }
@@ -175,6 +193,7 @@ public final class ConversationLoop: @unchecked Sendable {
             audit?.logCapabilityCheck(tool: call.tool, args: call.args, approved: false, reason: reason)
             return ResolvedTool(
                 content: "<tool_result source=\"untrusted\">Permission denied: \(reason)</tool_result>",
+                summary: "denied: \(reason)",
                 isError: true,
                 kill: false
             )
@@ -199,6 +218,7 @@ public final class ConversationLoop: @unchecked Sendable {
                 audit?.logUserApproval(tool: call.tool, args: call.args, decision: "deny", cached: false)
                 return ResolvedTool(
                     content: "<tool_result source=\"untrusted\">User denied this tool call.</tool_result>",
+                    summary: "denied by user",
                     isError: true,
                     kill: false
                 )
@@ -206,6 +226,7 @@ public final class ConversationLoop: @unchecked Sendable {
                 audit?.logUserApproval(tool: call.tool, args: call.args, decision: "deny_and_kill", cached: false)
                 return ResolvedTool(
                     content: "<tool_result source=\"untrusted\">User denied this tool call and terminated the session.</tool_result>",
+                    summary: "denied + session killed",
                     isError: true,
                     kill: true
                 )
@@ -213,6 +234,9 @@ public final class ConversationLoop: @unchecked Sendable {
         }
 
         // Layer 3: execute the tool under sandbox-exec.
+        // Emit the toolCall event now — only for calls that actually run.
+        await event?(.toolCall(name: call.tool, args: call.args, id: use.id))
+
         FileHandle.standardError.write(Data("[tool] \(call.tool) invoked under sandbox-exec\n".utf8))
         let result = await invokeToolRunner(toolName: call.tool, argsJSON: use.inputJSON)
         audit?.logToolResult(
@@ -222,6 +246,7 @@ public final class ConversationLoop: @unchecked Sendable {
             output: result.isError ? nil : result.content,
             error: result.isError ? result.content : nil
         )
+        await event?(.toolResult(toolUseId: use.id, success: !result.isError, summary: result.summary))
         return result
     }
 
@@ -250,6 +275,7 @@ public final class ConversationLoop: @unchecked Sendable {
         guard let toolCallData = try? JSONSerialization.data(withJSONObject: toolCallObj) else {
             return ResolvedTool(
                 content: "<tool_result source=\"untrusted\">Failed to build tool call JSON.</tool_result>",
+                summary: "internal error: bad JSON",
                 isError: true,
                 kill: false
             )
@@ -282,6 +308,7 @@ public final class ConversationLoop: @unchecked Sendable {
         } catch {
             return ResolvedTool(
                 content: "<tool_result source=\"untrusted\">Failed to launch ToolRunner: \(error)</tool_result>",
+                summary: "launch failed: \(error)",
                 isError: true,
                 kill: false
             )
@@ -303,10 +330,22 @@ public final class ConversationLoop: @unchecked Sendable {
             let errorMsg = parsed["error"] as? String
             if success, let output = output {
                 let wrapped = "<tool_result source=\"untrusted\" origin=\"\(session.workspacePath)\">\n\(output)\n</tool_result>"
-                return ResolvedTool(content: wrapped, isError: false, kill: false)
+                let bytes = output.utf8.count
+                // Short results get inlined as the summary; long ones are byte counts.
+                let summary: String
+                let oneLine = output
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                    .replacingOccurrences(of: "\n", with: " ")
+                if bytes <= 80 {
+                    summary = "\(bytes) B · \(oneLine)"
+                } else {
+                    summary = "\(bytes) B"
+                }
+                return ResolvedTool(content: wrapped, summary: summary, isError: false, kill: false)
             } else {
                 return ResolvedTool(
                     content: "<tool_result source=\"untrusted\">Tool failed: \(errorMsg ?? "unknown error")</tool_result>",
+                    summary: errorMsg ?? "unknown error",
                     isError: true,
                     kill: false
                 )
@@ -316,6 +355,7 @@ public final class ConversationLoop: @unchecked Sendable {
         // ToolRunner crashed before emitting a result.
         return ResolvedTool(
             content: "<tool_result source=\"untrusted\">ToolRunner exited \(exit) with no result. stdout: \(stdoutString)</tool_result>",
+            summary: "ToolRunner exited \(exit) with no result",
             isError: true,
             kill: false
         )

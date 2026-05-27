@@ -13,9 +13,59 @@ final class AppState: ObservableObject {
     @Published var isThinking: Bool = false
     @Published var statusText: String = "Initializing…"
     @Published var draft: String = ""
+    @Published var pendingApproval: PendingApproval?
 
     private var loop: ConversationLoop?
     private var initError: String?
+
+    // MARK: - Approval bridge
+    //
+    // The ConversationLoop calls an async @Sendable approval callback from a
+    // background task. We bridge that to SwiftUI by suspending on a
+    // continuation and surfacing the request as `pendingApproval`, which the
+    // ChatView presents as a sheet. The sheet's buttons resume the
+    // continuation. The sheet is non-dismissible — there is no way to escape
+    // an approval decision, which is the point.
+
+    struct PendingApproval: Identifiable {
+        let id = UUID()
+        let call: ToolCall
+        let continuation: CheckedContinuation<ApprovalDecision, Never>
+    }
+
+    func requestApproval(_ call: ToolCall) async -> ApprovalDecision {
+        await withCheckedContinuation { continuation in
+            // Already on the main actor (AppState is @MainActor).
+            self.pendingApproval = PendingApproval(call: call, continuation: continuation)
+        }
+    }
+
+    func resolveApproval(_ decision: ApprovalDecision) {
+        guard let pending = pendingApproval else { return }
+        pendingApproval = nil
+        pending.continuation.resume(returning: decision)
+    }
+
+    // MARK: - Turn events (tool activity surfaced inline)
+
+    func handleTurnEvent(_ event: TurnEvent) {
+        switch event {
+        case .toolCall(let name, let args, _):
+            messages.append(.init(role: .tool, text: renderToolCall(name: name, args: args)))
+        case .toolResult(_, let success, let summary):
+            let mark = success ? "✓" : "✗"
+            messages.append(.init(role: .tool, text: "\(mark) \(summary)"))
+        }
+    }
+
+    private func renderToolCall(name: String, args: [String: String]) -> String {
+        if args.isEmpty { return "→ \(name)()" }
+        let parts = args.sorted { $0.key < $1.key }.map { kv -> String in
+            let v = kv.value.count > 60 ? String(kv.value.prefix(57)) + "…" : kv.value
+            return "\(kv.key): \(v)"
+        }
+        return "→ \(name)(\(parts.joined(separator: ", ")))"
+    }
 
     init() {
         bootstrap()
@@ -151,7 +201,14 @@ final class AppState: ObservableObject {
         self.loop = ConversationLoop(
             session: session,
             provider: provider,
-            approvalCallback: ApprovalDialog.present,
+            approvalCallback: { [weak self] call in
+                guard let self else { return .deny }
+                return await self.requestApproval(call)
+            },
+            eventCallback: { [weak self] event in
+                guard let self else { return }
+                await self.handleTurnEvent(event)
+            },
             auditLogger: audit
         )
 
@@ -174,5 +231,6 @@ struct ChatMessage: Identifiable, Equatable {
         case user
         case assistant
         case system
+        case tool          // tool call requested or tool result, rendered inline
     }
 }

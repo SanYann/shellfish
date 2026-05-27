@@ -83,6 +83,11 @@ struct ChatView: View {
             .padding(12)
         }
         .onAppear { inputFocused = true }
+        .sheet(item: $state.pendingApproval) { pending in
+            ApprovalSheet(call: pending.call) { decision in
+                state.resolveApproval(decision)
+            }
+        }
     }
 }
 
@@ -93,12 +98,47 @@ struct MessageRow: View {
         HStack(alignment: .top, spacing: 10) {
             roleBadge
                 .frame(width: 60, alignment: .leading)
-            Text(message.text)
-                .textSelection(.enabled)
-                .fixedSize(horizontal: false, vertical: true)
+            messageBody
             Spacer(minLength: 0)
         }
         .padding(.horizontal, 12)
+    }
+
+    /// Assistant messages render inline Markdown (**bold**, `code`, *italics*,
+    /// links). Newlines are preserved. Multi-line code fences aren't fully
+    /// rendered as blocks (that needs a real Markdown view, not just
+    /// AttributedString) but the inline formatting is the 90% win.
+    @ViewBuilder
+    private var messageBody: some View {
+        switch message.role {
+        case .assistant:
+            Text(assistantAttributed)
+                .textSelection(.enabled)
+                .fixedSize(horizontal: false, vertical: true)
+        case .tool:
+            Text(message.text)
+                .font(.system(.caption, design: .monospaced))
+                .foregroundStyle(.orange)
+                .textSelection(.enabled)
+                .fixedSize(horizontal: false, vertical: true)
+        case .system:
+            Text(message.text)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+        case .user:
+            Text(message.text)
+                .textSelection(.enabled)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+    }
+
+    private var assistantAttributed: AttributedString {
+        let options = AttributedString.MarkdownParsingOptions(
+            interpretedSyntax: .inlineOnlyPreservingWhitespace
+        )
+        return (try? AttributedString(markdown: message.text, options: options))
+            ?? AttributedString(message.text)
     }
 
     @ViewBuilder
@@ -116,6 +156,10 @@ struct MessageRow: View {
             Text("system")
                 .font(.system(.caption, design: .monospaced))
                 .foregroundStyle(.secondary)
+        case .tool:
+            Text("tool")
+                .font(.system(.caption, design: .monospaced, weight: .semibold))
+                .foregroundStyle(.orange)
         }
     }
 }
