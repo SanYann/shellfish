@@ -346,16 +346,21 @@ public final class ConversationLoop: @unchecked Sendable {
             let errorMsg = parsed["error"] as? String
             if success, let output = output {
                 let wrapped = "<tool_result source=\"untrusted\" origin=\"\(session.workspacePath)\">\n\(output)\n</tool_result>"
-                let bytes = output.utf8.count
-                // Short results get inlined as the summary; long ones are byte counts.
-                let summary: String
                 let oneLine = output
                     .trimmingCharacters(in: .whitespacesAndNewlines)
                     .replacingOccurrences(of: "\n", with: " ")
-                if bytes <= 80 {
-                    summary = "\(bytes) B · \(oneLine)"
+                let summary: String
+                if toolName == "fs_write" || toolName == "fs.write" {
+                    // ToolRunner's write confirmation already states the byte
+                    // count ("Wrote N bytes to …"). Prefixing the length of
+                    // *that message* is just noise, so show it as-is — with the
+                    // workspace prefix stripped so the path reads cleanly.
+                    summary = oneLine.replacingOccurrences(of: session.workspacePath + "/", with: "")
                 } else {
-                    summary = "\(bytes) B"
+                    // Reads/lists: the output IS the data, so its size is the
+                    // meaningful number. Short results get inlined too.
+                    let bytes = output.utf8.count
+                    summary = bytes <= 80 ? "\(bytes) B · \(oneLine)" : "\(bytes) B"
                 }
                 return ResolvedTool(content: wrapped, summary: summary, isError: false, kill: false)
             } else {
