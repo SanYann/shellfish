@@ -266,7 +266,8 @@ public final class ConversationLoop: @unchecked Sendable {
             args: call.args,
             success: !result.isError,
             output: result.isError ? nil : result.content,
-            error: result.isError ? result.content : nil
+            // Log the clean summary, not the model-facing <tool_result> envelope.
+            error: result.isError ? result.summary : nil
         )
         await event?(.toolResult(toolUseId: use.id, success: !result.isError, summary: result.summary))
         return result
@@ -339,7 +340,43 @@ public final class ConversationLoop: @unchecked Sendable {
         try? stdinPipe.fileHandleForWriting.write(contentsOf: toolCallData)
         try? stdinPipe.fileHandleForWriting.close()
 
+        // Wait for exit with a 30s hard cap. Poll cooperatively (no blocked
+        // thread) so the turn stays cancellable: Stop terminates the
+        // subprocess, and a hung tool can't wedge the session forever.
+        var waited = 0.0
+        var endReason = "exited"
+        while process.isRunning {
+            if Task.isCancelled {
+                process.terminate()
+                endReason = "cancelled"
+                break
+            }
+            if waited >= 30.0 {
+                process.terminate()
+                endReason = "timeout"
+                break
+            }
+            try? await Task.sleep(nanoseconds: 50_000_000)  // 50ms
+            waited += 0.05
+        }
         process.waitUntilExit()
+
+        if endReason == "timeout" {
+            return ResolvedTool(
+                content: "<tool_result source=\"untrusted\">ToolRunner exceeded the 30s limit and was terminated.</tool_result>",
+                summary: "timed out after 30s",
+                isError: true,
+                kill: false
+            )
+        }
+        if endReason == "cancelled" {
+            return ResolvedTool(
+                content: "<tool_result source=\"untrusted\">Tool call cancelled.</tool_result>",
+                summary: "cancelled",
+                isError: true,
+                kill: false
+            )
+        }
 
         let stdoutData = stdoutPipe.fileHandleForReading.readDataToEndOfFile()
         let exit = process.terminationStatus

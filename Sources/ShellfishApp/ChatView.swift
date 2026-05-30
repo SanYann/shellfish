@@ -24,6 +24,32 @@ struct ChatView: View {
                     ProgressView()
                         .controlSize(.small)
                 }
+
+                Menu {
+                    ForEach(state.presets) { preset in
+                        Button {
+                            state.selectPreset(preset)
+                        } label: {
+                            if preset.id == state.selectedPreset.id {
+                                Label(preset.name, systemImage: "checkmark")
+                            } else {
+                                Text(preset.name)
+                            }
+                        }
+                    }
+                    Divider()
+                    Button("Change Workspace…") { state.chooseWorkspace() }
+                } label: {
+                    HStack(spacing: 4) {
+                        Image(systemName: state.selectedPreset.canWrite ? "pencil.circle" : "eye.circle")
+                        Text(state.selectedPreset.canWrite ? "read/write" : "read-only")
+                    }
+                    .font(.caption)
+                }
+                .menuStyle(.borderlessButton)
+                .fixedSize()
+                .help("Session capabilities & workspace")
+
                 Button {
                     state.newSession()
                 } label: {

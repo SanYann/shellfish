@@ -57,18 +57,38 @@ struct ShellfishMain: App {
             CommandMenu("Session") {
                 Button("Show Audit Log") { state.showAudit = true }
                     .keyboardShortcut("l", modifiers: .command)
+                Button("Change Workspace…") { state.chooseWorkspace() }
+                    .keyboardShortcut("o", modifiers: .command)
+                Divider()
+                Picker("Capabilities", selection: presetBinding) {
+                    ForEach(state.presets) { Text($0.name).tag($0) }
+                }
             }
         }
 
         // A lightweight menu-bar presence alongside the window: quick status
-        // plus the two actions you'd want without hunting for the window.
+        // plus the actions you'd want without hunting for the window.
         MenuBarExtra("Shellfish", systemImage: "lock.shield") {
             Text(state.isThinking ? "Working…" : "Ready")
+            Divider()
+            Picker("Capabilities", selection: presetBinding) {
+                ForEach(state.presets) { Text($0.name).tag($0) }
+            }
+            Button("Change Workspace…") { state.chooseWorkspace() }
             Divider()
             Button("New Session") { state.newSession() }
             Button("Show Audit Log") { state.showAudit = true }
             Divider()
             Button("Quit Shellfish") { NSApp.terminate(nil) }
         }
+    }
+
+    /// Two-way binding for the capability Picker: reads the active preset,
+    /// and a change starts a fresh session with the new capabilities.
+    private var presetBinding: Binding<SessionPreset> {
+        Binding(
+            get: { state.selectedPreset },
+            set: { state.selectPreset($0) }
+        )
     }
 }

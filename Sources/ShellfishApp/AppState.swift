@@ -5,6 +5,7 @@
 
 import Foundation
 import SwiftUI
+import AppKit
 import ShellfishCore
 
 @MainActor
@@ -15,12 +16,18 @@ final class AppState: ObservableObject {
     @Published var draft: String = ""
     @Published var pendingApproval: PendingApproval?
     @Published var showAudit: Bool = false
+    @Published var selectedPreset: SessionPreset = SessionPreset.all[0]
+
+    let presets = SessionPreset.all
 
     private var loop: ConversationLoop?
     private var initError: String?
     // Readable by the approval sheet so it can flag paths that resolve
     // outside the workspace. Set once during bootstrap.
     private(set) var workspacePath: String = ""
+    // Set when the user picks a folder via "Change Workspace…"; nil uses the
+    // default ./workspaces/poc.
+    private var workspaceOverride: String?
     // Surfaced to the audit viewer.
     private(set) var auditLogPath: String?
     private(set) var sessionId: String = ""
@@ -191,6 +198,29 @@ final class AppState: ObservableObject {
         bootstrap()
     }
 
+    /// Switch capability preset (read-only vs read/write). Starts a fresh
+    /// session because capabilities are fixed for a session's lifetime.
+    func selectPreset(_ preset: SessionPreset) {
+        guard preset.id != selectedPreset.id else { return }
+        selectedPreset = preset
+        bootstrap()
+    }
+
+    /// Let the user point the session at a different folder. Tools stay
+    /// confined to whatever is chosen. Starts a fresh session.
+    func chooseWorkspace() {
+        let panel = NSOpenPanel()
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.allowsMultipleSelection = false
+        panel.prompt = "Use as Workspace"
+        panel.message = "Pick a folder for this Shellfish session. Tools are confined to it."
+        if panel.runModal() == .OK, let url = panel.url {
+            workspaceOverride = url.path
+            bootstrap()
+        }
+    }
+
     private func bootstrap() {
         // Idempotent — newSession() calls this again, so tear down prior state.
         if let pending = pendingApproval {
@@ -203,7 +233,7 @@ final class AppState: ObservableObject {
         messages.removeAll()
 
         let cwd = FileManager.default.currentDirectoryPath
-        let workspacePath = "\(cwd)/workspaces/poc"
+        let workspacePath = workspaceOverride ?? "\(cwd)/workspaces/poc"
         self.workspacePath = workspacePath
         let sandboxProfilePath = "\(cwd)/profiles/toolrunner-strict.sb"
         let toolRunnerPath = "\(cwd)/.build/debug/ToolRunner"
@@ -226,15 +256,20 @@ final class AppState: ObservableObject {
             }
         }
 
+        // Tools advertised to Claude depend on the preset. A read-only session
+        // never sees fs_write, and the broker also denies it at the capability
+        // layer — defense the model can't talk its way around.
         let tools: [ToolDef]
         do {
-            tools = [
+            var defs: [ToolDef] = [
                 try ToolDef(
                     name: "fs_read",
                     description: "Read a text file from the session workspace. Only paths inside the workspace are allowed.",
                     inputSchema: ["type": "object", "properties": ["path": ["type": "string"]], "required": ["path"]]
                 ),
-                try ToolDef(
+            ]
+            if selectedPreset.canWrite {
+                defs.append(try ToolDef(
                     name: "fs_write",
                     description: "Write text content to a file in the session workspace.",
                     inputSchema: [
@@ -245,32 +280,40 @@ final class AppState: ObservableObject {
                         ],
                         "required": ["path", "content"],
                     ]
-                ),
-                try ToolDef(
-                    name: "fs_list",
-                    description: "List the entries of a directory in the session workspace. Returns JSON [{name, isDir, size}, ...].",
-                    inputSchema: [
-                        "type": "object",
-                        "properties": ["path": ["type": "string"]],
-                        "required": [],
-                    ]
-                ),
-            ]
+                ))
+            }
+            defs.append(try ToolDef(
+                name: "fs_list",
+                description: "List the entries of a directory in the session workspace. Returns JSON [{name, isDir, size}, ...].",
+                inputSchema: [
+                    "type": "object",
+                    "properties": ["path": ["type": "string"]],
+                    "required": [],
+                ]
+            ))
+            tools = defs
         } catch {
             statusText = "Failed to build tool defs: \(error)"
             messages.append(.init(role: .system, text: statusText))
             return
         }
+        let toolNames = tools.map { $0.name }.joined(separator: ", ")
+        let readonlyNote = selectedPreset.canWrite
+            ? ""
+            : " This session is read-only — you have no way to write files."
 
         let session = Session(
             workspacePath: workspacePath,
-            capabilities: Capabilities(fsRead: [workspacePath], fsWrite: [workspacePath]),
+            capabilities: Capabilities(
+                fsRead: [workspacePath],
+                fsWrite: selectedPreset.canWrite ? [workspacePath] : []
+            ),
             tools: tools,
             systemPrompt: """
                 You are a helpful assistant operating inside a sandboxed workspace.
                 The workspace is at: \(workspacePath).
-                Your tools: fs_read, fs_write, fs_list. All paths must be absolute
-                and inside the workspace; reads/writes outside are denied.
+                Your tools: \(toolNames). All paths must be absolute and inside
+                the workspace; reads/writes outside are denied.\(readonlyNote)
                 Do not invent file contents — if a tool call fails, say so plainly.
                 """,
             sandboxProfilePath: sandboxProfilePath,
@@ -321,9 +364,23 @@ final class AppState: ObservableObject {
         if let audit = audit {
             messages.append(.init(role: .system, text: "Audit log: \(audit.logPath)"))
         }
-        messages.append(.init(role: .system, text: "Session: \(session.id)"))
-        messages.append(.init(role: .system, text: "Tools: fs_read, fs_write, fs_list"))
+        messages.append(.init(role: .system, text: "Session: \(session.id) · \(selectedPreset.name)"))
+        messages.append(.init(role: .system, text: "Tools: \(toolNames)"))
     }
+}
+
+/// A capability preset the user can pick before/while running a session.
+/// Kept tiny on purpose: the point is to demonstrate that capabilities are
+/// fixed per session and that a read-only session genuinely cannot write.
+struct SessionPreset: Identifiable, Hashable {
+    let id: String
+    let name: String
+    let canWrite: Bool
+
+    static let all: [SessionPreset] = [
+        SessionPreset(id: "rw", name: "Workspace files (read/write)", canWrite: true),
+        SessionPreset(id: "ro", name: "Read & summarize (read-only)", canWrite: false),
+    ]
 }
 
 struct ChatMessage: Identifiable, Equatable {
