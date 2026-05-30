@@ -75,6 +75,9 @@ public enum TurnEvent: Sendable {
     /// A tool call finished. `summary` is a short string for the UI
     /// (full content goes through the model, not here).
     case toolResult(toolUseId: String, success: Bool, summary: String)
+    /// Transient operational note for the UI, e.g. "retrying after overload".
+    /// Not part of the model conversation — purely a status hint.
+    case notice(String)
 }
 
 public typealias EventCallback = @Sendable (TurnEvent) async -> Void
@@ -130,6 +133,9 @@ public final class ConversationLoop: @unchecked Sendable {
                     tools: session.tools,
                     onTextDelta: { delta in
                         await event(.textDelta(delta))
+                    },
+                    onRetry: { msg in
+                        await event(.notice(msg))
                     }
                 )
             } else {

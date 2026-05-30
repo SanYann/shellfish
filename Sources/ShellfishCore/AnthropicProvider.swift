@@ -114,6 +114,15 @@ public actor AnthropicProvider {
         status == 429 || status == 529 || (500...599).contains(status)
     }
 
+    /// Human-readable label for a transient status, used in retry notices.
+    private func statusLabel(_ status: Int) -> String {
+        switch status {
+        case 429: return "rate limit"
+        case 529: return "overloaded"
+        default:  return "server error \(status)"
+        }
+    }
+
     /// Sleep with exponential backoff before the next attempt. Honors a
     /// server-sent Retry-After (seconds) when present, otherwise backs off
     /// 0.5s, 1s, 2s, 4s … capped. `Task.sleep` throws on cancellation, so the
@@ -132,7 +141,8 @@ public actor AnthropicProvider {
     public func send(
         turns: [ConversationTurn],
         system: String? = nil,
-        tools: [ToolDef] = []
+        tools: [ToolDef] = [],
+        onRetry: (@Sendable (String) async -> Void)? = nil
     ) async throws -> AssistantMessage {
         // Build request body as raw [String: Any].
         var body: [String: Any] = [
@@ -194,6 +204,7 @@ public actor AnthropicProvider {
             } catch {
                 // Network blip — retry a few times, then surface it.
                 if attempt < maxRetries {
+                    await onRetry?("Network hiccup, retrying (\(attempt + 1)/\(maxRetries))…")
                     try await sleepBackoff(attempt: attempt, retryAfter: nil)
                     attempt += 1
                     continue
@@ -207,6 +218,7 @@ public actor AnthropicProvider {
                 break
             }
             if isTransient(http.statusCode), attempt < maxRetries {
+                await onRetry?("Anthropic \(statusLabel(http.statusCode)), retrying (\(attempt + 1)/\(maxRetries))…")
                 try await sleepBackoff(attempt: attempt, retryAfter: http.value(forHTTPHeaderField: "retry-after"))
                 attempt += 1
                 continue
@@ -263,7 +275,8 @@ public actor AnthropicProvider {
         turns: [ConversationTurn],
         system: String? = nil,
         tools: [ToolDef] = [],
-        onTextDelta: @Sendable @escaping (String) async -> Void
+        onTextDelta: @Sendable @escaping (String) async -> Void,
+        onRetry: (@Sendable (String) async -> Void)? = nil
     ) async throws -> AssistantMessage {
         // Build the request body identically to `send`, plus stream: true.
         var body: [String: Any] = [
@@ -331,6 +344,7 @@ public actor AnthropicProvider {
                 (attemptBytes, response) = try await session.bytes(for: request)
             } catch {
                 if attempt < maxRetries {
+                    await onRetry?("Network hiccup, retrying (\(attempt + 1)/\(maxRetries))…")
                     try await sleepBackoff(attempt: attempt, retryAfter: nil)
                     attempt += 1
                     continue
@@ -351,6 +365,7 @@ public actor AnthropicProvider {
                 if bodyText.count > 4096 { break }
             }
             if isTransient(http.statusCode), attempt < maxRetries {
+                await onRetry?("Anthropic \(statusLabel(http.statusCode)), retrying (\(attempt + 1)/\(maxRetries))…")
                 try await sleepBackoff(attempt: attempt, retryAfter: http.value(forHTTPHeaderField: "retry-after"))
                 attempt += 1
                 continue

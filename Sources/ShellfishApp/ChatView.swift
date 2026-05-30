@@ -13,15 +13,32 @@ struct ChatView: View {
     var body: some View {
         VStack(spacing: 0) {
             // Status bar
-            HStack {
+            HStack(spacing: 10) {
                 Text(state.statusText)
                     .font(.caption)
                     .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
                 Spacer()
                 if state.isThinking {
                     ProgressView()
                         .controlSize(.small)
                 }
+                Button {
+                    state.newSession()
+                } label: {
+                    Image(systemName: "square.and.pencil")
+                }
+                .buttonStyle(.borderless)
+                .help("New session (⌘N)")
+
+                Button {
+                    state.showAudit = true
+                } label: {
+                    Image(systemName: "list.bullet.rectangle")
+                }
+                .buttonStyle(.borderless)
+                .help("Audit log (⌘L)")
             }
             .padding(.horizontal, 12)
             .padding(.vertical, 8)
@@ -98,6 +115,9 @@ struct ChatView: View {
                 state.resolveApproval(decision)
             }
         }
+        .sheet(isPresented: $state.showAudit) {
+            AuditLogView(logPath: state.auditLogPath, currentSession: state.sessionId)
+        }
     }
 }
 
@@ -115,16 +135,25 @@ struct MessageRow: View {
     }
 
     /// Assistant messages render inline Markdown (**bold**, `code`, *italics*,
-    /// links). Newlines are preserved. Multi-line code fences aren't fully
-    /// rendered as blocks (that needs a real Markdown view, not just
-    /// AttributedString) but the inline formatting is the 90% win.
+    /// links) for prose, and fenced ``` blocks as real monospace code boxes.
+    /// The text is split into prose/code segments first; an unterminated fence
+    /// (mid-stream) still renders as code so streaming looks right.
     @ViewBuilder
     private var messageBody: some View {
         switch message.role {
         case .assistant:
-            Text(assistantAttributed)
-                .textSelection(.enabled)
-                .fixedSize(horizontal: false, vertical: true)
+            VStack(alignment: .leading, spacing: 8) {
+                ForEach(Array(parseChatSegments(message.text).enumerated()), id: \.offset) { _, seg in
+                    switch seg {
+                    case .prose(let s):
+                        Text(chatMarkdown(s))
+                            .textSelection(.enabled)
+                            .fixedSize(horizontal: false, vertical: true)
+                    case .code(let lang, let body):
+                        codeBlock(lang: lang, body: body)
+                    }
+                }
+            }
         case .tool:
             Text(message.text)
                 .font(.system(.caption, design: .monospaced))
@@ -143,12 +172,24 @@ struct MessageRow: View {
         }
     }
 
-    private var assistantAttributed: AttributedString {
-        let options = AttributedString.MarkdownParsingOptions(
-            interpretedSyntax: .inlineOnlyPreservingWhitespace
-        )
-        return (try? AttributedString(markdown: message.text, options: options))
-            ?? AttributedString(message.text)
+    @ViewBuilder
+    private func codeBlock(lang: String?, body: String) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            if let lang = lang, !lang.isEmpty {
+                Text(lang)
+                    .font(.system(.caption2, design: .monospaced))
+                    .foregroundStyle(.secondary)
+            }
+            Text(body)
+                .font(.system(.callout, design: .monospaced))
+                .textSelection(.enabled)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .padding(10)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(.quaternary.opacity(0.5))
+        .clipShape(RoundedRectangle(cornerRadius: 6))
     }
 
     @ViewBuilder
@@ -172,4 +213,66 @@ struct MessageRow: View {
                 .foregroundStyle(.orange)
         }
     }
+}
+
+// MARK: - Markdown / code-fence segmentation
+
+enum ChatSegment {
+    case prose(String)
+    case code(lang: String?, body: String)
+}
+
+/// Split assistant text into prose and fenced-code segments. A ``` line
+/// toggles code mode; the language tag after the opening fence is captured.
+/// An unterminated fence (the model is still streaming the block) flushes as
+/// code so it renders correctly before the closing fence arrives.
+func parseChatSegments(_ text: String) -> [ChatSegment] {
+    var result: [ChatSegment] = []
+    var inCode = false
+    var lang: String?
+    var buffer: [String] = []
+
+    func flushProse() {
+        let joined = buffer.joined(separator: "\n")
+        buffer.removeAll()
+        if !joined.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            result.append(.prose(joined))
+        }
+    }
+    func flushCode() {
+        let joined = buffer.joined(separator: "\n")
+        buffer.removeAll()
+        result.append(.code(lang: lang, body: joined))
+        lang = nil
+    }
+
+    for line in text.components(separatedBy: "\n") {
+        let trimmed = line.trimmingCharacters(in: .whitespaces)
+        if trimmed.hasPrefix("```") {
+            if inCode {
+                flushCode()
+                inCode = false
+            } else {
+                flushProse()
+                inCode = true
+                let tag = trimmed.dropFirst(3).trimmingCharacters(in: .whitespaces)
+                lang = tag.isEmpty ? nil : String(tag)
+            }
+            continue
+        }
+        buffer.append(line)
+    }
+    if inCode { flushCode() } else { flushProse() }
+    return result
+}
+
+/// Inline-only Markdown (bold, italics, inline `code`, links) with newlines
+/// preserved. Block constructs other than code fences are intentionally left
+/// to render as plain text — the fences are handled by the segmenter.
+func chatMarkdown(_ text: String) -> AttributedString {
+    let options = AttributedString.MarkdownParsingOptions(
+        interpretedSyntax: .inlineOnlyPreservingWhitespace
+    )
+    return (try? AttributedString(markdown: text, options: options))
+        ?? AttributedString(text)
 }

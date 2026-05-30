@@ -14,12 +14,19 @@ final class AppState: ObservableObject {
     @Published var statusText: String = "Initializing…"
     @Published var draft: String = ""
     @Published var pendingApproval: PendingApproval?
+    @Published var showAudit: Bool = false
 
     private var loop: ConversationLoop?
     private var initError: String?
     // Readable by the approval sheet so it can flag paths that resolve
     // outside the workspace. Set once during bootstrap.
     private(set) var workspacePath: String = ""
+    // Surfaced to the audit viewer.
+    private(set) var auditLogPath: String?
+    private(set) var sessionId: String = ""
+    // The "Ready · workspace: …" line, restored after a turn so transient
+    // retry notices don't stick in the status bar.
+    private var readyStatus: String = ""
     private var currentTurnTask: Task<Void, Never>?
 
     // MARK: - Approval bridge
@@ -69,6 +76,11 @@ final class AppState: ObservableObject {
         case .toolResult(_, let success, let summary):
             let mark = success ? "✓" : "✗"
             messages.append(.init(role: .tool, text: "\(mark) \(summary)"))
+        case .notice(let msg):
+            // Transient operational hint (e.g. retry after overload). Show it
+            // in the status bar; it's cleared back to readyStatus when the
+            // turn settles.
+            statusText = msg
         }
     }
 
@@ -108,6 +120,7 @@ final class AppState: ObservableObject {
                 await MainActor.run {
                     self.isThinking = false
                     self.currentTurnTask = nil
+                    self.statusText = self.readyStatus
                     // Text already streamed in via .textDelta events; don't
                     // double-append. The exception is .killed sessions where
                     // we want a visible "terminated" marker.
@@ -119,12 +132,14 @@ final class AppState: ObservableObject {
                 await MainActor.run {
                     self.isThinking = false
                     self.currentTurnTask = nil
+                    self.statusText = self.readyStatus
                     self.messages.append(.init(role: .system, text: "[stopped]"))
                 }
             } catch {
                 await MainActor.run {
                     self.isThinking = false
                     self.currentTurnTask = nil
+                    self.statusText = self.readyStatus
                     self.messages.append(.init(role: .system, text: self.friendlyError(error)))
                 }
             }
@@ -170,7 +185,23 @@ final class AppState: ObservableObject {
 
     // MARK: - Bootstrap
 
+    /// Start a fresh session: new id, new conversation loop, cleared
+    /// transcript. The audit log is append-only so it carries across.
+    func newSession() {
+        bootstrap()
+    }
+
     private func bootstrap() {
+        // Idempotent — newSession() calls this again, so tear down prior state.
+        if let pending = pendingApproval {
+            pending.continuation.resume(returning: .denyAndKill)
+            pendingApproval = nil
+        }
+        currentTurnTask?.cancel()
+        currentTurnTask = nil
+        isThinking = false
+        messages.removeAll()
+
         let cwd = FileManager.default.currentDirectoryPath
         let workspacePath = "\(cwd)/workspaces/poc"
         self.workspacePath = workspacePath
@@ -260,6 +291,8 @@ final class AppState: ObservableObject {
             return
         }
 
+        self.sessionId = session.id
+
         let audit: AuditLogger?
         do {
             audit = try AuditLogger(sessionId: session.id)
@@ -267,6 +300,7 @@ final class AppState: ObservableObject {
             audit = nil
             messages.append(.init(role: .system, text: "Audit logger init failed (\(error)); continuing without audit."))
         }
+        self.auditLogPath = audit?.logPath
 
         self.loop = ConversationLoop(
             session: session,
@@ -283,6 +317,7 @@ final class AppState: ObservableObject {
         )
 
         statusText = "Ready · workspace: \(workspacePath)"
+        readyStatus = statusText
         if let audit = audit {
             messages.append(.init(role: .system, text: "Audit log: \(audit.logPath)"))
         }
