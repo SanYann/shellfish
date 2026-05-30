@@ -2,7 +2,7 @@
 
 **Goal:** a single demo where you type a message in a SwiftUI window, Claude reads a file from a sandboxed workspace, and writes a summary back. Sandbox-enforced, broker-approved, audit-logged.
 **Time budget:** 3–4 months evenings + weekends. If you blow past 5 months, stop and reassess.
-**Status:** plan · **Date:** 2026-05-06 · **Companion to:** `development-plan.md`
+**Status:** functionally complete (2026-05-30) · **Date started:** 2026-05-06 · **Companion to:** `development-plan.md`
 
 ---
 
@@ -248,12 +248,20 @@ That's Stage 4. Send the recording (and the repo link) to one technically-credib
 
 All of the following must be true:
 
-- [ ] You can have a full back-and-forth conversation with Claude inside a Shellfish window.
-- [ ] At least one tool call (fs.read) goes through approval and executes inside the strict sandbox.
-- [ ] At least one attempted tool call outside the workspace is rejected (broker OR sandbox OR both).
-- [ ] The audit log records every tool call with timestamps and result hashes.
-- [ ] The S1 / S2 / S4 PoCs still pass after all the changes.
-- [ ] You can record the demo above start-to-finish without it crashing.
+- [x] You can have a full back-and-forth conversation with Claude inside a Shellfish window.
+- [x] At least one tool call (fs.read) goes through approval and executes inside the strict sandbox.
+- [x] At least one attempted tool call outside the workspace is rejected (broker OR sandbox OR both).
+- [x] The audit log records every tool call with timestamps and result hashes.
+- [x] The S1 / S2 / S4 PoCs still pass after all the changes.
+- [ ] You can record the demo above start-to-finish without it crashing. *(app runs end-to-end; recording is a user action)*
+
+**Status: functionally complete (2026-05-30).** Built beyond the plan in two
+places: the approval sheet resolves paths and flags sensitive/escaping targets
+(incl. symlink unmasking), and the transcript renders Markdown + fenced code.
+Streaming, a Stop button, retry-with-backoff, a menu-bar presence, capability
+presets, and a workspace picker all landed. Next gate per `development-plan.md`
+is the Stage 5+ fork (MCP / multi-provider / Keychain / signing) — decide
+after the demo + an outside reaction.
 
 If any of these are false at month 4, treat that as a signal that Stage 4 has scope-crept and either trim to make it true or stop.
 
