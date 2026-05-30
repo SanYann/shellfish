@@ -72,13 +72,23 @@ struct ChatView: View {
                     .onSubmit { state.send() }
                     .disabled(state.isThinking)
 
-                Button {
-                    state.send()
-                } label: {
-                    Image(systemName: "paperplane.fill")
+                if state.isThinking {
+                    Button {
+                        state.stop()
+                    } label: {
+                        Image(systemName: "stop.fill")
+                    }
+                    .keyboardShortcut(".", modifiers: [.command])
+                    .help("Stop (⌘.)")
+                } else {
+                    Button {
+                        state.send()
+                    } label: {
+                        Image(systemName: "paperplane.fill")
+                    }
+                    .keyboardShortcut(.return, modifiers: [.command])
+                    .disabled(state.draft.trimmingCharacters(in: .whitespaces).isEmpty)
                 }
-                .keyboardShortcut(.return, modifiers: [.command])
-                .disabled(state.isThinking || state.draft.trimmingCharacters(in: .whitespaces).isEmpty)
             }
             .padding(12)
         }

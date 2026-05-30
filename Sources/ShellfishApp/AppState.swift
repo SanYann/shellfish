@@ -17,6 +17,8 @@ final class AppState: ObservableObject {
 
     private var loop: ConversationLoop?
     private var initError: String?
+    private var workspacePath: String = ""
+    private var currentTurnTask: Task<Void, Never>?
 
     // MARK: - Approval bridge
     //
@@ -50,6 +52,16 @@ final class AppState: ObservableObject {
 
     func handleTurnEvent(_ event: TurnEvent) {
         switch event {
+        case .textDelta(let delta):
+            // If the last message is already an assistant bubble for this
+            // streaming block, append in place. Otherwise start a new one.
+            // Tool-row events in between automatically "break" the streak
+            // and start a fresh assistant bubble afterwards.
+            if !messages.isEmpty, messages[messages.count - 1].role == .assistant {
+                messages[messages.count - 1].text.append(delta)
+            } else {
+                messages.append(.init(role: .assistant, text: delta))
+            }
         case .toolCall(let name, let args, _):
             messages.append(.init(role: .tool, text: renderToolCall(name: name, args: args)))
         case .toolResult(_, let success, let summary):
@@ -61,7 +73,14 @@ final class AppState: ObservableObject {
     private func renderToolCall(name: String, args: [String: String]) -> String {
         if args.isEmpty { return "→ \(name)()" }
         let parts = args.sorted { $0.key < $1.key }.map { kv -> String in
-            let v = kv.value.count > 60 ? String(kv.value.prefix(57)) + "…" : kv.value
+            var v = kv.value
+            // Render workspace-internal paths as relative — much easier to
+            // scan and reinforces that everything is inside the workspace.
+            let prefix = workspacePath + "/"
+            if (kv.key == "path" || kv.key.hasSuffix("_path")), v.hasPrefix(prefix) {
+                v = String(v.dropFirst(prefix.count))
+            }
+            if v.count > 60 { v = String(v.prefix(57)) + "…" }
             return "\(kv.key): \(v)"
         }
         return "→ \(name)(\(parts.joined(separator: ", ")))"
@@ -80,23 +99,46 @@ final class AppState: ObservableObject {
         messages.append(.init(role: .user, text: text))
         isThinking = true
 
-        Task {
+        currentTurnTask = Task { [weak self] in
+            guard let self else { return }
             do {
                 let result = try await loop.runTurn(userInput: text)
                 await MainActor.run {
                     self.isThinking = false
-                    self.messages.append(.init(role: .assistant, text: result.assistantText))
+                    self.currentTurnTask = nil
+                    // Text already streamed in via .textDelta events; don't
+                    // double-append. The exception is .killed sessions where
+                    // we want a visible "terminated" marker.
                     if result.killed {
                         self.messages.append(.init(role: .system, text: "[session terminated by deny+kill]"))
                     }
                 }
+            } catch is CancellationError {
+                await MainActor.run {
+                    self.isThinking = false
+                    self.currentTurnTask = nil
+                    self.messages.append(.init(role: .system, text: "[stopped]"))
+                }
             } catch {
                 await MainActor.run {
                     self.isThinking = false
+                    self.currentTurnTask = nil
                     self.messages.append(.init(role: .system, text: "Turn failed: \(error)"))
                 }
             }
         }
+    }
+
+    /// User pressed Stop. Cancels any in-flight turn and resolves any
+    /// open approval prompt with denyAndKill so the loop exits cleanly.
+    func stop() {
+        if let pending = pendingApproval {
+            pendingApproval = nil
+            pending.continuation.resume(returning: .denyAndKill)
+        }
+        currentTurnTask?.cancel()
+        currentTurnTask = nil
+        isThinking = false
     }
 
     // MARK: - Bootstrap
@@ -104,6 +146,7 @@ final class AppState: ObservableObject {
     private func bootstrap() {
         let cwd = FileManager.default.currentDirectoryPath
         let workspacePath = "\(cwd)/workspaces/poc"
+        self.workspacePath = workspacePath
         let sandboxProfilePath = "\(cwd)/profiles/toolrunner-strict.sb"
         let toolRunnerPath = "\(cwd)/.build/debug/ToolRunner"
         let buildDirPath = "\(cwd)/.build"
@@ -222,10 +265,17 @@ final class AppState: ObservableObject {
 }
 
 struct ChatMessage: Identifiable, Equatable {
-    let id = UUID()
+    let id: UUID
     let role: Role
-    let text: String
-    let timestamp: Date = Date()
+    var text: String       // var so streaming deltas can append in-place
+    let timestamp: Date
+
+    init(id: UUID = UUID(), role: Role, text: String, timestamp: Date = Date()) {
+        self.id = id
+        self.role = role
+        self.text = text
+        self.timestamp = timestamp
+    }
 
     enum Role: Equatable {
         case user

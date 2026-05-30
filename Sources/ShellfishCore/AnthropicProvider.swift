@@ -210,4 +210,180 @@ public actor AnthropicProvider {
             stopReason: stopReason
         )
     }
+
+    // MARK: - Streaming
+
+    /// Same as `send`, but streams the response as Server-Sent Events.
+    /// `onTextDelta` is called once per text-delta chunk as it arrives.
+    /// Tool-use blocks are accumulated server-side and returned whole at
+    /// the end — the SSE format streams their input JSON as deltas too,
+    /// but for the chat UX the tool call is short and only meaningful
+    /// when complete.
+    public func sendStreaming(
+        turns: [ConversationTurn],
+        system: String? = nil,
+        tools: [ToolDef] = [],
+        onTextDelta: @Sendable @escaping (String) async -> Void
+    ) async throws -> AssistantMessage {
+        // Build the request body identically to `send`, plus stream: true.
+        var body: [String: Any] = [
+            "model": model,
+            "max_tokens": maxTokens,
+            "stream": true,
+        ]
+        if let system = system, !system.isEmpty {
+            body["system"] = system
+        }
+        if !tools.isEmpty {
+            body["tools"] = try tools.map { tool -> [String: Any] in
+                let schema = try JSONSerialization.jsonObject(with: tool.inputSchemaJSON)
+                return [
+                    "name": tool.name,
+                    "description": tool.description,
+                    "input_schema": schema,
+                ]
+            }
+        }
+        body["messages"] = turns.map { turn -> [String: Any] in
+            [
+                "role": turn.role,
+                "content": turn.blocks.map { block -> [String: Any] in
+                    switch block {
+                    case .text(let t):
+                        return ["type": "text", "text": t]
+                    case .toolUse(let id, let name, let input):
+                        let parsed = (try? JSONSerialization.jsonObject(with: input)) ?? [:]
+                        return ["type": "tool_use", "id": id, "name": name, "input": parsed]
+                    case .toolResult(let id, let content, let isError):
+                        var block: [String: Any] = [
+                            "type": "tool_result",
+                            "tool_use_id": id,
+                            "content": content,
+                        ]
+                        if isError { block["is_error"] = true }
+                        return block
+                    }
+                },
+            ]
+        }
+        let bodyData = try JSONSerialization.data(withJSONObject: body)
+
+        var request = URLRequest(url: URL(string: "https://api.anthropic.com/v1/messages")!)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue("text/event-stream", forHTTPHeaderField: "Accept")
+        request.setValue(apiKey, forHTTPHeaderField: "x-api-key")
+        request.setValue("2023-06-01", forHTTPHeaderField: "anthropic-version")
+        request.httpBody = bodyData
+        // Per-request timeout for the initial response; the stream itself
+        // can run long without tripping the resource timeout.
+        request.timeoutInterval = 120
+
+        let (bytes, response) = try await session.bytes(for: request)
+
+        guard let http = response as? HTTPURLResponse else {
+            throw AnthropicError.invalidResponse(status: -1, body: "")
+        }
+        if !(200..<300).contains(http.statusCode) {
+            var bodyText = ""
+            for try await line in bytes.lines {
+                bodyText += line + "\n"
+                if bodyText.count > 4096 { break }
+            }
+            throw AnthropicError.invalidResponse(status: http.statusCode, body: bodyText)
+        }
+
+        // Per-content-block accumulators. Anthropic's stream interleaves
+        // content_block_start / content_block_delta / content_block_stop
+        // for each block by index. We keep a small map by index.
+        struct BlockBuilder {
+            var type: String = ""
+            var text: String = ""
+            var toolUseId: String = ""
+            var toolUseName: String = ""
+            var toolUseInputJSON: String = ""
+        }
+        var blocks: [Int: BlockBuilder] = [:]
+        var stopReason = "unknown"
+
+        for try await line in bytes.lines {
+            try Task.checkCancellation()
+            guard line.hasPrefix("data: ") else { continue }
+            let payload = String(line.dropFirst(6))
+            guard
+                let data = payload.data(using: .utf8),
+                let event = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                let kind = event["type"] as? String
+            else { continue }
+
+            switch kind {
+            case "content_block_start":
+                if
+                    let index = event["index"] as? Int,
+                    let block = event["content_block"] as? [String: Any]
+                {
+                    var b = BlockBuilder()
+                    b.type = (block["type"] as? String) ?? ""
+                    if b.type == "tool_use" {
+                        b.toolUseId = (block["id"] as? String) ?? ""
+                        b.toolUseName = (block["name"] as? String) ?? ""
+                    }
+                    blocks[index] = b
+                }
+            case "content_block_delta":
+                if
+                    let index = event["index"] as? Int,
+                    let delta = event["delta"] as? [String: Any],
+                    let deltaType = delta["type"] as? String
+                {
+                    if deltaType == "text_delta", let text = delta["text"] as? String {
+                        blocks[index]?.text.append(text)
+                        await onTextDelta(text)
+                    } else if deltaType == "input_json_delta", let partial = delta["partial_json"] as? String {
+                        blocks[index]?.toolUseInputJSON.append(partial)
+                    }
+                    // thinking_delta and others ignored for now.
+                }
+            case "content_block_stop":
+                // No-op; block already accumulated.
+                continue
+            case "message_delta":
+                if let delta = event["delta"] as? [String: Any],
+                   let reason = delta["stop_reason"] as? String {
+                    stopReason = reason
+                }
+            case "message_stop":
+                break
+            case "error":
+                if let err = event["error"] as? [String: Any] {
+                    let msg = (err["message"] as? String) ?? String(describing: err)
+                    throw AnthropicError.invalidResponse(status: -1, body: "stream error: \(msg)")
+                }
+            default:
+                continue
+            }
+        }
+
+        // Assemble the final AssistantMessage from accumulated blocks.
+        var texts: [String] = []
+        var toolUses: [AssistantMessage.ToolUse] = []
+        for index in blocks.keys.sorted() {
+            let b = blocks[index]!
+            switch b.type {
+            case "text":
+                if !b.text.isEmpty { texts.append(b.text) }
+            case "tool_use":
+                let inputData = b.toolUseInputJSON.data(using: .utf8) ?? Data()
+                toolUses.append(.init(id: b.toolUseId, name: b.toolUseName, inputJSON: inputData))
+            default:
+                continue
+            }
+        }
+
+        return AssistantMessage(
+            textBlocks: texts,
+            toolUses: toolUses,
+            stopReason: stopReason
+        )
+    }
 }

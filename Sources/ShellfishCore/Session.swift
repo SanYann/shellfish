@@ -68,6 +68,8 @@ public typealias ApprovalCallback = @Sendable (ToolCall) async -> ApprovalDecisi
 /// Fired by ConversationLoop during a turn so the UI can render tool
 /// activity inline in the chat (not only behind an approval sheet).
 public enum TurnEvent: Sendable {
+    /// Incremental assistant text. Emitted as tokens stream from the model.
+    case textDelta(String)
     /// A tool call has been approved and is about to run.
     case toolCall(name: String, args: [String: String], id: String)
     /// A tool call finished. `summary` is a short string for the UI
@@ -118,11 +120,25 @@ public final class ConversationLoop: @unchecked Sendable {
         var lastText = ""
 
         loop: while true {
-            let response = try await provider.send(
-                turns: transcript,
-                system: session.systemPrompt,
-                tools: session.tools
-            )
+            // Stream when a UI is attached (so deltas can render live); use
+            // the non-streaming path for headless CLI runs.
+            let response: AssistantMessage
+            if let event = self.event {
+                response = try await provider.sendStreaming(
+                    turns: transcript,
+                    system: session.systemPrompt,
+                    tools: session.tools,
+                    onTextDelta: { delta in
+                        await event(.textDelta(delta))
+                    }
+                )
+            } else {
+                response = try await provider.send(
+                    turns: transcript,
+                    system: session.systemPrompt,
+                    tools: session.tools
+                )
+            }
 
             // Capture assistant text from this round.
             lastText = response.textBlocks.joined(separator: "\n")
