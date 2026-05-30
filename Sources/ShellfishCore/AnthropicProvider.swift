@@ -86,6 +86,8 @@ public actor AnthropicProvider {
     private let model: String
     private let maxTokens: Int
     private let session: URLSession
+    /// How many times to retry a transient failure before giving up.
+    private let maxRetries = 4
 
     public init(
         apiKey: String? = nil,
@@ -101,6 +103,30 @@ public actor AnthropicProvider {
         self.model = model
         self.maxTokens = maxTokens
         self.session = session
+    }
+
+    // MARK: - Retry policy
+
+    /// HTTP statuses worth retrying: rate limit (429), overloaded (529), and
+    /// transient server errors (5xx). Other 4xx are caller errors — not
+    /// retried, because resending won't help.
+    private func isTransient(_ status: Int) -> Bool {
+        status == 429 || status == 529 || (500...599).contains(status)
+    }
+
+    /// Sleep with exponential backoff before the next attempt. Honors a
+    /// server-sent Retry-After (seconds) when present, otherwise backs off
+    /// 0.5s, 1s, 2s, 4s … capped. `Task.sleep` throws on cancellation, so the
+    /// Stop button still interrupts a turn that's mid-backoff.
+    private func sleepBackoff(attempt: Int, retryAfter: String?) async throws {
+        let delay: TimeInterval
+        if let retryAfter, let secs = Double(retryAfter) {
+            delay = min(secs, 30)
+        } else {
+            delay = min(pow(2.0, Double(attempt)) * 0.5, 8.0)
+        }
+        FileHandle.standardError.write(Data("[anthropic] transient failure, retrying in \(delay)s (attempt \(attempt + 1)/\(maxRetries))\n".utf8))
+        try await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
     }
 
     public func send(
@@ -159,18 +185,32 @@ public actor AnthropicProvider {
         request.httpBody = bodyData
         request.timeoutInterval = 120
 
-        let data: Data
-        let response: URLResponse
-        do {
-            (data, response) = try await session.data(for: request)
-        } catch {
-            throw AnthropicError.transportError(error)
-        }
-
-        guard let http = response as? HTTPURLResponse else {
-            throw AnthropicError.invalidResponse(status: -1, body: String(data: data, encoding: .utf8) ?? "")
-        }
-        guard (200..<300).contains(http.statusCode) else {
+        var data = Data()
+        var attempt = 0
+        while true {
+            let response: URLResponse
+            do {
+                (data, response) = try await session.data(for: request)
+            } catch {
+                // Network blip — retry a few times, then surface it.
+                if attempt < maxRetries {
+                    try await sleepBackoff(attempt: attempt, retryAfter: nil)
+                    attempt += 1
+                    continue
+                }
+                throw AnthropicError.transportError(error)
+            }
+            guard let http = response as? HTTPURLResponse else {
+                throw AnthropicError.invalidResponse(status: -1, body: String(data: data, encoding: .utf8) ?? "")
+            }
+            if (200..<300).contains(http.statusCode) {
+                break
+            }
+            if isTransient(http.statusCode), attempt < maxRetries {
+                try await sleepBackoff(attempt: attempt, retryAfter: http.value(forHTTPHeaderField: "retry-after"))
+                attempt += 1
+                continue
+            }
             throw AnthropicError.invalidResponse(
                 status: http.statusCode,
                 body: String(data: data, encoding: .utf8) ?? ""
@@ -279,16 +319,41 @@ public actor AnthropicProvider {
         // can run long without tripping the resource timeout.
         request.timeoutInterval = 120
 
-        let (bytes, response) = try await session.bytes(for: request)
-
-        guard let http = response as? HTTPURLResponse else {
-            throw AnthropicError.invalidResponse(status: -1, body: "")
-        }
-        if !(200..<300).contains(http.statusCode) {
+        // Retry transient failures here — before any text delta is emitted, so
+        // a retry can't duplicate streamed output. A mid-stream error event
+        // (rare) is still a hard fail since deltas may already be on screen.
+        var bytes: URLSession.AsyncBytes!
+        var attempt = 0
+        while true {
+            let attemptBytes: URLSession.AsyncBytes
+            let response: URLResponse
+            do {
+                (attemptBytes, response) = try await session.bytes(for: request)
+            } catch {
+                if attempt < maxRetries {
+                    try await sleepBackoff(attempt: attempt, retryAfter: nil)
+                    attempt += 1
+                    continue
+                }
+                throw AnthropicError.transportError(error)
+            }
+            guard let http = response as? HTTPURLResponse else {
+                throw AnthropicError.invalidResponse(status: -1, body: "")
+            }
+            if (200..<300).contains(http.statusCode) {
+                bytes = attemptBytes
+                break
+            }
+            // Non-2xx: drain a little of the body for the error message.
             var bodyText = ""
-            for try await line in bytes.lines {
+            for try await line in attemptBytes.lines {
                 bodyText += line + "\n"
                 if bodyText.count > 4096 { break }
+            }
+            if isTransient(http.statusCode), attempt < maxRetries {
+                try await sleepBackoff(attempt: attempt, retryAfter: http.value(forHTTPHeaderField: "retry-after"))
+                attempt += 1
+                continue
             }
             throw AnthropicError.invalidResponse(status: http.statusCode, body: bodyText)
         }

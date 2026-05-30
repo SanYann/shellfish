@@ -125,9 +125,34 @@ final class AppState: ObservableObject {
                 await MainActor.run {
                     self.isThinking = false
                     self.currentTurnTask = nil
-                    self.messages.append(.init(role: .system, text: "Turn failed: \(error)"))
+                    self.messages.append(.init(role: .system, text: self.friendlyError(error)))
                 }
             }
+        }
+    }
+
+    /// Turn the raw provider error into something a person can act on.
+    /// The provider already retried transient failures with backoff, so by
+    /// the time we land here the failure is either persistent or exhausted
+    /// its retries — tell the user whether to just resend or fix something.
+    private func friendlyError(_ error: Error) -> String {
+        guard let e = error as? AnthropicError else {
+            return "Turn failed: \(error)"
+        }
+        switch e {
+        case .invalidResponse(let status, _):
+            switch status {
+            case 429: return "Anthropic rate limit hit. Give it a few seconds and resend."
+            case 529: return "Anthropic is overloaded right now. Give it a few seconds and resend."
+            case 401: return "API key rejected (401). Check ANTHROPIC_API_KEY."
+            default:  return "Anthropic API error (\(status)). Resend to try again."
+            }
+        case .transportError:
+            return "Network error reaching Anthropic. Check your connection and resend."
+        case .missingAPIKey:
+            return "ANTHROPIC_API_KEY is not set."
+        case .decodingFailed(let why):
+            return "Couldn't parse the API response: \(why)"
         }
     }
 
