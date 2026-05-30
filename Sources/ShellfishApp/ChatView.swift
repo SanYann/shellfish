@@ -94,7 +94,7 @@ struct ChatView: View {
         }
         .onAppear { inputFocused = true }
         .sheet(item: $state.pendingApproval) { pending in
-            ApprovalSheet(call: pending.call) { decision in
+            ApprovalSheet(call: pending.call, workspacePath: state.workspacePath) { decision in
                 state.resolveApproval(decision)
             }
         }

@@ -17,7 +17,9 @@ final class AppState: ObservableObject {
 
     private var loop: ConversationLoop?
     private var initError: String?
-    private var workspacePath: String = ""
+    // Readable by the approval sheet so it can flag paths that resolve
+    // outside the workspace. Set once during bootstrap.
+    private(set) var workspacePath: String = ""
     private var currentTurnTask: Task<Void, Never>?
 
     // MARK: - Approval bridge
