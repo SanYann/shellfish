@@ -79,9 +79,21 @@ public struct PermissionBroker: Sendable {
                 ? .deny(reason: "fs.read not granted to this session (fs.list requires it)")
                 : .approve
         case "http_fetch":
-            return capabilities.netFetch.isEmpty
-                ? .deny(reason: "net.fetch not granted to this session")
-                : .approve
+            if capabilities.netFetch.isEmpty {
+                return .deny(reason: "net.fetch not granted to this session")
+            }
+            // Enforce the per-domain allow-list, not just "net granted".
+            // "*" means any host; otherwise match the host exactly or as a
+            // suffix (so "example.com" also allows "www.example.com").
+            let urlString = call.args["url"] ?? ""
+            guard let host = URL(string: urlString)?.host, !host.isEmpty else {
+                return .deny(reason: "http_fetch requires a valid http(s) URL")
+            }
+            let permitted = capabilities.netFetch.contains("*")
+                || capabilities.netFetch.contains { host == $0 || host.hasSuffix("." + $0) }
+            return permitted
+                ? .approve
+                : .deny(reason: "host '\(host)' not in this session's net.fetch allow-list")
         default:
             return .deny(reason: "unknown tool '\(call.tool)'")
         }

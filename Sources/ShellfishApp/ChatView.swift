@@ -41,8 +41,8 @@ struct ChatView: View {
                     Button("Change Workspace…") { state.chooseWorkspace() }
                 } label: {
                     HStack(spacing: 4) {
-                        Image(systemName: state.selectedPreset.canWrite ? "pencil.circle" : "eye.circle")
-                        Text(state.selectedPreset.canWrite ? "read/write" : "read-only")
+                        Image(systemName: state.selectedPreset.icon)
+                        Text(state.selectedPreset.shortLabel)
                     }
                     .font(.caption)
                 }

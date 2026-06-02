@@ -125,6 +125,13 @@ struct ApprovalSheet: View {
         }
     }
 
+    // MARK: - http_fetch destination
+
+    private var fetchURL: String? {
+        guard call.tool == "http_fetch" else { return nil }
+        return call.args["url"]
+    }
+
     // MARK: - fs_write preview
 
     private var isWrite: Bool { call.tool == "fs_write" || call.tool == "fs.write" }
@@ -181,6 +188,10 @@ struct ApprovalSheet: View {
                 VStack(alignment: .leading, spacing: 10) {
                     ForEach(pathArgs) { pathRow($0) }
                 }
+            }
+
+            if let urlString = fetchURL {
+                networkSection(urlString)
             }
 
             writePreviewSection
@@ -284,6 +295,34 @@ struct ApprovalSheet: View {
                     .fixedSize(horizontal: false, vertical: true)
             }
         }
+    }
+
+    @ViewBuilder
+    private func networkSection(_ urlString: String) -> some View {
+        let host = URL(string: urlString)?.host ?? "unknown host"
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(alignment: .top, spacing: 8) {
+                Image(systemName: "globe")
+                    .foregroundStyle(.orange)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Outbound request to \(host)")
+                        .font(.subheadline.weight(.semibold))
+                        .foregroundStyle(.orange)
+                    Text("This sends a request over the network. Anything in the URL leaves your machine — check the destination.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            }
+            Text(urlString)
+                .font(.system(.caption, design: .monospaced))
+                .textSelection(.enabled)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(10)
+        .background(Color.orange.opacity(0.12))
+        .clipShape(RoundedRectangle(cornerRadius: 8))
     }
 
     @ViewBuilder

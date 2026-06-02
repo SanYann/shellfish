@@ -27,7 +27,8 @@ public struct Session: Sendable {
     public let capabilities: Capabilities
     public let tools: [ToolDef]
     public let systemPrompt: String?
-    public let sandboxProfilePath: String  // absolute path to .sb file
+    public let sandboxProfilePath: String  // strict profile, used by fs.* tools
+    public let networkProfilePath: String? // network profile, used by http_fetch
     public let toolRunnerPath: String      // absolute path to ToolRunner binary
     public let buildDirPath: String        // for sandbox-exec -D BUILDDIR
 
@@ -38,6 +39,7 @@ public struct Session: Sendable {
         tools: [ToolDef],
         systemPrompt: String?,
         sandboxProfilePath: String,
+        networkProfilePath: String? = nil,
         toolRunnerPath: String,
         buildDirPath: String
     ) {
@@ -47,6 +49,7 @@ public struct Session: Sendable {
         self.tools = tools
         self.systemPrompt = systemPrompt
         self.sandboxProfilePath = sandboxProfilePath
+        self.networkProfilePath = networkProfilePath
         self.toolRunnerPath = toolRunnerPath
         self.buildDirPath = buildDirPath
     }
@@ -304,19 +307,33 @@ public final class ConversationLoop: @unchecked Sendable {
             )
         }
 
+        // Pick the sandbox profile per tool: http_fetch runs under the
+        // network profile (outbound allowed, /Users still unreadable); every
+        // filesystem tool runs under the strict profile (no network at all).
+        // The two capabilities therefore never share a process — the OS never
+        // lets one ToolRunner both read user data and reach the network.
+        let isFetch = (toolName == "http_fetch")
+        let profilePath = isFetch
+            ? (session.networkProfilePath ?? session.sandboxProfilePath)
+            : session.sandboxProfilePath
+
         // Spawn /usr/bin/sandbox-exec ... /path/to/ToolRunner.
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/sandbox-exec")
         process.arguments = [
             "-D", "WORKSPACE=\(session.workspacePath)",
             "-D", "BUILDDIR=\(session.buildDirPath)",
-            "-f", session.sandboxProfilePath,
+            "-f", profilePath,
             session.toolRunnerPath,
         ]
 
-        // ToolRunner reads SHELLFISH_WORKSPACE for its application-level path check.
+        // ToolRunner reads SHELLFISH_WORKSPACE for its application-level path
+        // check, and SHELLFISH_NETFETCH_ALLOW to re-validate the fetch host.
         var env = ProcessInfo.processInfo.environment
         env["SHELLFISH_WORKSPACE"] = session.workspacePath
+        if isFetch {
+            env["SHELLFISH_NETFETCH_ALLOW"] = session.capabilities.netFetch.joined(separator: ",")
+        }
         process.environment = env
 
         let stdinPipe = Pipe()
@@ -388,7 +405,18 @@ public final class ConversationLoop: @unchecked Sendable {
             let output = parsed["output"] as? String
             let errorMsg = parsed["error"] as? String
             if success, let output = output {
-                let wrapped = "<tool_result source=\"untrusted\" origin=\"\(session.workspacePath)\">\n\(output)\n</tool_result>"
+                // Tag the result's origin: a fetched page is labelled with its
+                // URL (so the model sees external, untrusted provenance), a
+                // file with the workspace it came from.
+                let origin: String
+                if isFetch,
+                   let obj = try? JSONSerialization.jsonObject(with: argsJSON) as? [String: Any],
+                   let url = obj["url"] as? String {
+                    origin = url
+                } else {
+                    origin = session.workspacePath
+                }
+                let wrapped = "<tool_result source=\"untrusted\" origin=\"\(origin)\">\n\(output)\n</tool_result>"
                 let oneLine = output
                     .trimmingCharacters(in: .whitespacesAndNewlines)
                     .replacingOccurrences(of: "\n", with: " ")

@@ -1,0 +1,39 @@
+;; Shellfish PoC — NETWORK profile.
+;;
+;; Used only for the http_fetch tool, and only when the session was granted a
+;; net.fetch capability. Allows OUTBOUND network but keeps the filesystem
+;; claim that matters for the trifecta: this process cannot read /Users.
+;;
+;; Why `allow default` here instead of the strict profile's `deny default`:
+;;   URLSession drags in the whole networking stack (CFNetwork, trustd for
+;;   TLS, nsurlsessiond over XPC, …). Enumerating every operation it needs
+;;   under a default-deny is the exact v1 pain documented in
+;;   toolrunner-strict.sb — and a networking process crashes (SIGSEGV) when a
+;;   load-bearing operation is denied. So this profile starts permissive and
+;;   subtracts the two things that actually matter for THIS process:
+;;     1. It cannot read or write /Users (no private data to exfiltrate).
+;;     2. It cannot listen/bind (it is a client, never a server).
+;;
+;; The stronger filesystem guarantee (deny-default) lives in the STRICT
+;; profile used by fs.read/fs.write. The trifecta defense is that the two
+;; capabilities never share a process: a fs tool has no network, a net tool
+;; has no user-data read. This profile upholds its half of that.
+;;
+;; Per-domain allow-listing is enforced in the app layer (PermissionBroker +
+;; ToolRunner re-check + approval sheet shows the destination); sandbox-exec
+;; filters network by IP/port, not hostname.
+
+(version 1)
+
+(allow default)
+
+;; FILESYSTEM CLAIM: no user data, even though network is open.
+(deny file-read* (subpath "/Users"))
+(deny file-write* (subpath "/Users"))
+(allow file-read* (subpath (param "WORKSPACE")))
+(allow file-write* (subpath (param "WORKSPACE")))
+(allow file-read* (subpath (param "BUILDDIR")))
+
+;; Client only — never listen or bind.
+(deny network-inbound)
+(deny network-bind)

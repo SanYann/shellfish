@@ -151,13 +151,39 @@ case "http_fetch":
         emit(ToolResult(success: false, output: nil, error: "Missing or invalid url"))
         exit(2)
     }
+    guard let scheme = url.scheme?.lowercased(), scheme == "http" || scheme == "https" else {
+        emit(ToolResult(success: false, output: nil, error: "Only http/https URLs are allowed"))
+        exit(1)
+    }
+
+    // Application-layer domain allow-list (defense in depth — the broker
+    // checks this too). SHELLFISH_NETFETCH_ALLOW is a comma-separated list of
+    // host suffixes; "*" means any host.
+    let allowList = (ProcessInfo.processInfo.environment["SHELLFISH_NETFETCH_ALLOW"] ?? "")
+        .split(separator: ",")
+        .map { $0.trimmingCharacters(in: .whitespaces) }
+        .filter { !$0.isEmpty }
+    let host = url.host ?? ""
+    let hostPermitted = allowList.contains("*")
+        || allowList.contains { host == $0 || host.hasSuffix("." + $0) }
+    guard hostPermitted else {
+        emit(ToolResult(success: false, output: nil, error: "Host '\(host)' is not in this session's net.fetch allow-list"))
+        exit(1)
+    }
 
     let semaphore = DispatchSemaphore(value: 0)
     var success = false
     var output: String?
     var errorMsg: String?
 
-    let task = URLSession.shared.dataTask(with: url) { data, _, error in
+    // Ephemeral: no on-disk cache, cookies, or credential store. A sandboxed
+    // fetch tool should leave nothing behind, and it avoids touching the
+    // URLSession cache DB under ~/Library/Caches (denied by the profile).
+    let config = URLSessionConfiguration.ephemeral
+    config.timeoutIntervalForRequest = 10
+    config.timeoutIntervalForResource = 12
+    let urlSession = URLSession(configuration: config)
+    let task = urlSession.dataTask(with: url) { data, _, error in
         if let error = error {
             errorMsg = "\(error)"
         } else if let data = data {
